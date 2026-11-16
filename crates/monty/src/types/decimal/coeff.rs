@@ -80,6 +80,11 @@ impl Discarded {
 }
 
 impl Coeff {
+    /// How many 64-bit words the coefficient occupies, for the memory model.
+    pub(crate) fn limb_count(&self) -> usize {
+        self.words.len()
+    }
+
     /// Zero.
     pub(crate) fn zero() -> Self {
         Self::default()

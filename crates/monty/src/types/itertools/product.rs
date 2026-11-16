@@ -32,6 +32,11 @@ pub(crate) struct Product {
 }
 
 impl Product {
+    /// The values and positions the adaptor holds, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        self.pools.iter().map(Vec::len).sum::<usize>() + self.indices.len()
+    }
+
     /// Takes the collected pools and the result width `call_product` checked.
     ///
     /// `slots` is `pools.len() * repeat`, passed in rather than recomputed

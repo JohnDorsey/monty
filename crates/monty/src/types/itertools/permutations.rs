@@ -30,6 +30,11 @@ pub(crate) struct Permutations {
 }
 
 impl Permutations {
+    /// The values, positions and counters the adaptor holds, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        self.pool.len() + self.indices.len() + self.cycles.len()
+    }
+
     /// Takes the collected pool; `r` has been range-checked by the constructor.
     pub(crate) fn new(pool: Vec<Value>, r: usize) -> Self {
         let n = pool.len();

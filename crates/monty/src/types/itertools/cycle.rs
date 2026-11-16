@@ -25,6 +25,11 @@ pub(crate) struct Cycle {
 }
 
 impl Cycle {
+    /// The values the adaptor has buffered, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        self.saved.len()
+    }
+
     pub(crate) fn new(source: Value) -> Self {
         Self {
             source: Some(source),

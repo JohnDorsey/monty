@@ -27,6 +27,9 @@ impl From<&ResourceLimits> for pb::ResourceLimits {
                 .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
             max_feed_steps: limits.max_feed_steps,
             max_turn_steps: limits.max_turn_steps,
+            max_model_memory: limits
+                .max_model_memory
+                .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX)),
         }
     }
 }
@@ -39,6 +42,7 @@ impl From<pb::ResourceLimits> for ResourceLimits {
             max_feed_steps: limits.max_feed_steps,
             max_turn_steps: limits.max_turn_steps,
             max_memory: usize_field(limits.max_memory_bytes),
+            max_model_memory: usize_field(limits.max_model_memory),
             gc_interval: usize_field(limits.gc_interval),
             max_recursion_depth: usize_field(limits.max_recursion_depth).unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),
             max_suspensions: usize_field(limits.max_suspensions).unwrap_or(DEFAULT_MAX_SUSPENSIONS),

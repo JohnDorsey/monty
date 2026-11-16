@@ -3514,6 +3514,54 @@ async fn a_step_budget_stops_separate_workers_at_the_same_step() {
     assert_eq!(messages[0], messages[1]);
 }
 
+/// The deterministic memory limit travels over the wire to real worker processes, and two of them stop the
+/// same script at the same point, with the same count in the message: the property the allocator-backed limit
+/// cannot give, because that one reads everything the whole worker process has allocated.
+#[tokio::test]
+async fn the_model_memory_limit_stops_separate_workers_at_the_same_point() {
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        let pool = Pool::new(config()).await.unwrap();
+        let mut session = pool
+            .checkout(&ReplConfig {
+                limits: Some(ResourceLimits::default().max_model_memory(400_000)),
+                ..ReplConfig::default()
+            })
+            .await
+            .unwrap();
+        // Several short feeds that fit, then one that does not.
+        for _ in 0..3 {
+            let event = session
+                .feed("1 + 1", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap();
+            assert_eq!(expect_complete(event), MontyObject::int(2));
+        }
+        let err = session
+            .feed(
+                "x = []\nwhile True:\n    x.append([0])",
+                vec![],
+                vec![],
+                false,
+                &mut no_print,
+            )
+            .await
+            .unwrap_err();
+        let PoolError::Runtime(exc) = err else {
+            panic!("expected Runtime, got {err:?}");
+        };
+        assert_eq!(exc.exc_type().to_string(), "MemoryError");
+        messages.push(exc.message().unwrap_or_default().to_owned());
+        session.finish().await.unwrap();
+    }
+    assert!(
+        messages[0].starts_with("model memory limit exceeded: ") && messages[0].ends_with("> 400000 bytes"),
+        "{}",
+        messages[0]
+    );
+    assert_eq!(messages[0], messages[1]);
+}
+
 /// Budgets near `Duration::MAX` must not overflow the client's backstop
 /// arithmetic (remaining budget plus grace), in either scope.
 #[tokio::test]

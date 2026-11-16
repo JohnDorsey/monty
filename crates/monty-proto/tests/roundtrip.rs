@@ -646,6 +646,7 @@ fn resource_limits_round_trip() {
         max_feed_steps: Some(123_456_789),
         max_turn_steps: Some(4_567),
         max_memory: Some(64 * 1024 * 1024),
+        max_model_memory: Some(8_000_000),
         gc_interval: Some(100),
         max_recursion_depth: 50,
         max_suspensions: 7,
@@ -654,6 +655,7 @@ fn resource_limits_round_trip() {
     let back = ResourceLimits::from(pb::ResourceLimits::from(&limits));
     assert_eq!(back.max_feed_steps, Some(123_456_789));
     assert_eq!(back.max_turn_steps, Some(4_567));
+    assert_eq!(back.max_model_memory, Some(8_000_000));
     assert_eq!(back.max_feed_duration, limits.max_feed_duration);
     assert_eq!(back.max_turn_duration, limits.max_turn_duration);
     assert_eq!(back.max_total_sleep, limits.max_total_sleep);
@@ -805,6 +807,30 @@ fn empty_resource_limits_default_recursion_depth() {
     assert_eq!(back.max_suspensions, 1000);
     // The step budgets are unlimited unless the client names them.
     assert_eq!((back.max_feed_steps, back.max_turn_steps), (None, None));
+    // And so is the deterministic memory limit.
+    assert_eq!(back.max_model_memory, None);
+}
+
+/// The deterministic memory limit travels as its own wire field, separate from the allocator-backed one: the
+/// two are different measures and a client may set either, or both. Unset, it is not encoded at all, so a client
+/// that does not use it sends the bytes it always did.
+#[test]
+fn the_model_memory_limit_uses_its_own_wire_field() {
+    let model_only = pb::ResourceLimits::from(&ResourceLimits::default().max_model_memory(3_000_000));
+    assert_eq!(
+        (model_only.max_model_memory, model_only.max_memory_bytes),
+        (Some(3_000_000), None)
+    );
+    let allocator_only = pb::ResourceLimits::from(&ResourceLimits::default().max_memory(5_000_000));
+    assert_eq!(
+        (allocator_only.max_model_memory, allocator_only.max_memory_bytes),
+        (None, Some(5_000_000))
+    );
+    let neither = pb::ResourceLimits::from(&ResourceLimits::default());
+    assert_eq!(neither.max_model_memory, None);
+    // Three million is a four-byte varint, and the field's tag is one byte.
+    assert_eq!(model_only.encoded_len(), neither.encoded_len() + 5);
+    assert_eq!(ResourceLimits::from(model_only).max_model_memory, Some(3_000_000));
 }
 
 /// The step budgets travel as their own wire fields: a limit set in one scope never shows up in the other, and

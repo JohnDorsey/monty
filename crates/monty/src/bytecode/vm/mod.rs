@@ -34,7 +34,6 @@ use recursion::frame_recursion_depth;
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
 use scheduler::Scheduler;
 
-use crate::native_work;
 use crate::{
     args::ArgValues,
     asyncio::{CallId, TaskId},
@@ -45,7 +44,7 @@ use crate::{
     },
     defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput, HeapReader},
+    heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput, HeapReader, model},
     heap_data::{CellValue, Closure, FunctionDefaults},
     intern::{FunctionId, Interns, StaticStrings, StringId},
     modules::{
@@ -56,6 +55,7 @@ use crate::{
         time::apply_clock_reading,
     },
     name_map::NameMap,
+    native_work,
     object_bridge::MontyObjectExt,
     os_dispatch::{
         PendingEffect, PostConversionEffect, PreConversionEffect, Reshaped, check_raw_call_paths,
@@ -1204,15 +1204,43 @@ impl<'h> VM<'h> {
         // Checked for erroring turns too: session state survives Python
         // exceptions, so allocate-then-raise feeds must not evade the limits.
         // The uncatchable resource error out-ranks the turn's own error.
-        match self.heap.tracker.check_memory_time() {
+        let verdict = self
+            .heap
+            .tracker
+            .check_memory_time()
+            .map_err(RunError::from)
+            .and_then(|()| self.check_model_memory());
+        match verdict {
             Ok(()) => result,
             Err(e) => {
                 if let Ok(value) = result {
                     value.drop_with(self);
                 }
-                Err(e.into())
+                Err(e)
             }
         }
+    }
+
+    /// What the VM itself holds that the deterministic memory model counts, beside the heap: the operand
+    /// stack, the globals, and the call frames.
+    fn model_bytes(&self) -> usize {
+        (self.stack.len() + self.globals.len()) * model::VALUE_BYTES
+            + (self.suspended_frames.len() + 1) * model::FRAME_BYTES
+    }
+
+    /// Walks the session and tests the deterministic memory limit, when a walk is due (see
+    /// [`ResourceTracker::model_walk_due`]). Nothing at all without the limit.
+    ///
+    /// Runs only between instructions, where no heap payload is borrowed, which is what lets the walk read
+    /// every object.
+    fn check_model_memory(&mut self) -> Result<(), RunError> {
+        if !self.heap.tracker.model_walk_due() {
+            return Ok(());
+        }
+        let (heap_bytes, entries) = self.heap.model_walk();
+        let used = heap_bytes + self.model_bytes();
+        self.heap.tracker.record_model_walk(used, entries)?;
+        Ok(())
     }
 
     /// The rarely taken arms of [`handle_call_result!`]: turns a suspending
@@ -1282,6 +1310,7 @@ impl<'h> VM<'h> {
         self.heap.tracker.add_steps(u64::from(CHECK_INTERVAL) + 1);
         if check_limits {
             self.heap.tracker.check_memory_time()?;
+            self.check_model_memory()?;
         }
         if self.heap.should_gc() {
             self.run_gc();

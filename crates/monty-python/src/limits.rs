@@ -24,6 +24,7 @@ pub fn extract_limits(dict: &Bound<'_, PyDict>) -> PyResult<monty_types::Resourc
             LimitKey::MaxFeedSteps => limits.max_feed_steps(value.extract()?),
             LimitKey::MaxTurnSteps => limits.max_turn_steps(value.extract()?),
             LimitKey::MaxMemory => limits.max_memory(value.extract()?),
+            LimitKey::MaxModelMemory => limits.max_model_memory(value.extract()?),
             LimitKey::GcInterval => limits.gc_interval(value.extract()?),
             LimitKey::MaxRecursionDepth => limits.max_recursion_depth(value.extract()?),
             LimitKey::MaxSuspensions => limits.max_suspensions(value.extract()?),
@@ -52,6 +53,7 @@ enum LimitKey {
     MaxFeedSteps,
     MaxTurnSteps,
     MaxMemory,
+    MaxModelMemory,
     GcInterval,
     MaxRecursionDepth,
     MaxSuspensions,
@@ -68,6 +70,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for LimitKey {
             "max_feed_steps" => Ok(Self::MaxFeedSteps),
             "max_turn_steps" => Ok(Self::MaxTurnSteps),
             "max_memory" => Ok(Self::MaxMemory),
+            "max_model_memory" => Ok(Self::MaxModelMemory),
             "gc_interval" => Ok(Self::GcInterval),
             "max_recursion_depth" => Ok(Self::MaxRecursionDepth),
             "max_suspensions" => Ok(Self::MaxSuspensions),
@@ -81,8 +84,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for LimitKey {
                 Err(PyValueError::new_err(format!(
                     "unknown limits key {key_repr}; accepted keys are \
                      'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', \
-                     'max_turn_steps', 'max_memory', 'gc_interval', 'max_recursion_depth', \
-                     'max_suspensions', 'max_total_sleep_secs'"
+                     'max_turn_steps', 'max_memory', 'max_model_memory', 'gc_interval', \
+                     'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
                 )))
             }
         }

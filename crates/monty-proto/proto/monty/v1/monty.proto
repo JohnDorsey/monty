@@ -444,6 +444,15 @@ message ResourceLimits {
   // sends them declares protocol version 10, which such a worker refuses.
   optional uint64 max_feed_steps = 9;
   optional uint64 max_turn_steps = 10;
+  // Deterministic memory limit in bytes: the session's size by a fixed cost
+  // table over the logical size of every live object, never read from the
+  // allocator. A runaway script stops at the same step on every machine,
+  // whatever else the worker process allocates; `max_memory_bytes` above is
+  // the allocator-backed measure and may be set beside it. Enforced by the
+  // worker alone and not echoed. Absent = unlimited. A worker built before
+  // this field existed ignores it and would run without the limit, so a client
+  // that sends it declares protocol version 11, which such a worker refuses.
+  optional uint64 max_model_memory = 11;
 }
 
 // Mirrors monty's `OsPolicy`: the clock, zone, sleep, process clock and

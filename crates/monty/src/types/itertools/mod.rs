@@ -151,6 +151,34 @@ pub(crate) enum Kind {
 }
 
 impl ItertoolsIter {
+    /// How many values the adaptor holds in buffers of its own, for the memory model. Matched without a
+    /// wildcard so an adaptor that gains a buffer is noticed.
+    pub(crate) fn buffered_values(&self) -> usize {
+        match self {
+            Self::Cycle(cycle) => cycle.buffered_values(),
+            Self::Chain(chain) => chain.buffered_values(),
+            Self::Combinations(combinations) => combinations.buffered_values(),
+            Self::Permutations(permutations) => permutations.buffered_values(),
+            Self::Product(product) => product.buffered_values(),
+            Self::TeeBlock(block) => block.buffered_values(),
+            Self::Count(_)
+            | Self::Repeat(_)
+            | Self::Pairwise(_)
+            | Self::Compress(_)
+            | Self::Islice(_)
+            | Self::TakeWhile(_)
+            | Self::DropWhile(_)
+            | Self::FilterFalse(_)
+            | Self::StarMap(_)
+            | Self::Accumulate(_)
+            | Self::Batched(_)
+            | Self::ZipLongest(_)
+            | Self::GroupBy(_)
+            | Self::Grouper(_)
+            | Self::Tee(_) => 0,
+        }
+    }
+
     /// The adaptor tag, for dispatch without holding a borrow.
     pub(crate) fn kind(&self) -> Kind {
         match self {

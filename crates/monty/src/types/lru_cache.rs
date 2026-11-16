@@ -62,6 +62,11 @@ pub(crate) struct LruCache {
 }
 
 impl LruCache {
+    /// How many calls the cache remembers, for the memory model.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Wraps `func` (taking ownership), or, with `None`, stands in as the
     /// decorator that will wrap the next callable it is given.
     fn new(func: Option<Value>, maxsize: Option<u64>, typed: bool) -> Self {

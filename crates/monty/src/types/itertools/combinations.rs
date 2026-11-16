@@ -36,6 +36,11 @@ pub(crate) struct Combinations {
 }
 
 impl Combinations {
+    /// The values and positions the adaptor holds, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        self.pool.len() + self.indices.len()
+    }
+
     /// Takes the collected pool; `r` has been range-checked and, for the
     /// replacement flavour, preflighted by the constructor.
     pub(crate) fn new(pool: Vec<Value>, r: usize, replacement: bool) -> Self {

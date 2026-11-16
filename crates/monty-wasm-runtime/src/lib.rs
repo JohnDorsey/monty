@@ -382,6 +382,7 @@ fn configure_from_component(request: ConfigureRequest) -> pb::Configure {
             // The component interface (WIT) has no step budgets: a wasm session runs without them.
             max_feed_steps: None,
             max_turn_steps: None,
+            max_model_memory: None,
         }),
         type_check: request.type_check,
         type_check_stubs: request.type_check_stubs,

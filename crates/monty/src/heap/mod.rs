@@ -1207,6 +1207,11 @@ impl Heap {
             self.allocations_since_gc
                 .set(self.allocations_since_gc.get().wrapping_add(1));
         }
+        // Tells the deterministic memory limit how much was just taken on, so it can walk the session as soon
+        // as that could matter instead of waiting for its interval. A single branch when no limit is set.
+        if self.tracker.has_model_limit() {
+            self.tracker.note_model_growth(data.model_bytes());
+        }
 
         HeapEntry {
             refcount: Cell::new(1),
@@ -2361,6 +2366,9 @@ mod heap_reader_compile_fail_cases;
 #[cfg(test)]
 #[path = "../../tests/heap_reader/borrowed.rs"]
 mod borrowed_tests;
+
+// Declared down here so that it does not move the line numbers the compile-fail snapshots print.
+pub(crate) mod model;
 
 /// Cycle-collector unit tests.
 ///

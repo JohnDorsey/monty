@@ -57,6 +57,11 @@ pub(crate) struct HostClass {
 }
 
 impl HostClass {
+    /// How many attributes the instance holds, for the memory model.
+    pub(crate) fn attribute_count(&self) -> usize {
+        self.attrs.len()
+    }
+
     /// Creates a host class instance; ownership of `attrs` and of the
     /// `class_id` reference (a live [`HostClassType`] entry) transfers.
     #[must_use]

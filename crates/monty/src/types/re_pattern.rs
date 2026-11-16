@@ -93,6 +93,11 @@ pub(crate) enum BoundedCompileError {
 }
 
 impl RePattern {
+    /// The length of the pattern text in bytes, for the memory model.
+    pub(crate) fn pattern_len(&self) -> usize {
+        self.pattern.len()
+    }
+
     /// Creates a compiled pattern from a Python regex string and flags.
     ///
     /// Translates Python flag constants into inline regex flag prefixes and compiles

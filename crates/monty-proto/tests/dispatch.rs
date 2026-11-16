@@ -747,6 +747,66 @@ fn a_step_budget_stops_every_worker_at_the_same_count() {
     assert_eq!(messages[1], messages[2]);
 }
 
+/// The deterministic memory limit a client names in `Configure` reaches the interpreter: a runaway feed ends
+/// with the uncatchable `MemoryError`, and the same script stops at the same step in every worker.
+#[test]
+fn a_configured_model_memory_limit_stops_a_runaway_feed_at_the_same_step_in_every_worker() {
+    let limits = ResourceLimits::default().max_model_memory(500_000);
+    let runaway = "x = []\nwhile True:\n    x.append([0])";
+    let messages: Vec<String> = (0..3)
+        .map(|_| {
+            let mut worker = configured_worker(&limits);
+            let message = expect_error_message(feed(&mut worker, runaway).1);
+            // Still usable: a memory limit that stops a feed leaves the session to be discarded by the host,
+            // but the worker itself answers the next feed.
+            let (_, event) = feed(&mut worker, "1 + 1");
+            assert_eq!(expect_complete(event), MontyObject::int(2));
+            message
+        })
+        .collect();
+    assert!(
+        messages[0].starts_with("model memory limit exceeded: ") && messages[0].ends_with("> 500000 bytes"),
+        "{}",
+        messages[0]
+    );
+    assert_eq!(messages[0], messages[1]);
+    assert_eq!(messages[1], messages[2]);
+}
+
+/// A restored session keeps the model memory limit it was saved with, and the worker's own `Configure` can only
+/// tighten it.
+#[test]
+fn restore_keeps_and_tightens_the_model_memory_limit() {
+    for (saved, ceiling, effective) in [
+        (600_000, None, 600_000),
+        (600_000, Some(300_000), 300_000),
+        (300_000, Some(600_000), 300_000),
+    ] {
+        let repl = MontyRepl::new(
+            "saved.py",
+            ResourceTracker::new(ResourceLimits::default().max_model_memory(saved)),
+            CompileOptions::default(),
+        );
+        let progress = repl.feed_start("x = 42", vec![], PrintWriter::Stdout).unwrap();
+        let ReplProgress::Complete { repl, .. } = &progress else {
+            panic!("expected the feed to complete");
+        };
+        let state = dump("saved.py", None, &[], SessionRef::Idle(repl)).unwrap();
+        let configured = ceiling.map_or_else(ResourceLimits::default, |ceiling| {
+            ResourceLimits::default().max_model_memory(ceiling)
+        });
+        let mut worker = configured_worker(&configured);
+        let request = frame_request(pb::client_request::Kind::Load(pb::Load { state: state.into() }));
+        let (_, outcome) = dispatch_frame(&mut worker, &request);
+        assert_eq!(outcome, HandleOutcome::Continue);
+        let message = expect_error_message(feed(&mut worker, "x = []\nwhile True:\n    x.append([0])").1);
+        assert!(
+            message.ends_with(&format!("> {effective} bytes")),
+            "saved {saved}, ceiling {ceiling:?}: {message}"
+        );
+    }
+}
+
 /// A restored session keeps the step budget it was saved with, and the worker's own `Configure` can only
 /// tighten it.
 #[test]

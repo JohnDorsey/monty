@@ -180,6 +180,15 @@ class ResourceLimits(TypedDict, total=False):
     max_memory: int | None
     """Maximum heap memory in bytes."""
 
+    max_model_memory: int | None
+    """Maximum memory in bytes by a fixed cost model of what the session holds.
+
+    Every live object is priced from its logical size (a list by its length, a string by its bytes), never
+    from the allocator, so a script stops at the same step on every machine, however busy the process is,
+    and the limit needs no allocator support. Exceeding it raises an uncatchable `MemoryError`. The prices
+    are a convention that approximates a 64-bit build; a release that changes them changes where scripts
+    stop. May be set beside `max_memory`, which is the allocator-backed measure."""
+
     gc_interval: int | None
     """Run garbage collection every N allocations."""
 

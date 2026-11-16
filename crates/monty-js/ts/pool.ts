@@ -161,6 +161,13 @@ export interface ResourceLimits {
   /** Maximum deterministic steps between host round trips; see `maxFeedSteps`. */
   maxTurnSteps?: number
   maxMemory?: number
+  /**
+   * Maximum memory in bytes by a fixed cost model of what the session holds: every live object priced from its
+   * logical size, never from the allocator, so a script stops at the same step on every machine, however busy the
+   * process is. Exceeding it raises an uncatchable `MemoryError`. May be set beside `maxMemory`, which is the
+   * allocator-backed measure. Not supported by the WebAssembly worker, which throws instead of ignoring it.
+   */
+  maxModelMemory?: number
   gcInterval?: number
   maxRecursionDepth?: number
   maxSuspensions?: number

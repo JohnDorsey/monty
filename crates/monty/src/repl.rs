@@ -25,7 +25,7 @@ use crate::{
     bytecode::{FrameExit, ModuleCache, VM, VMSnapshot},
     defer_drop,
     exception_private::{ExcTypeExt, RunError},
-    heap::{DropWithContext, Heap, HeapData, HeapReader},
+    heap::{DropWithContext, Heap, HeapData, HeapReader, model::VALUE_BYTES},
     intern::Interns,
     name_map::NameMap,
     object_bridge::{MontyGraphExt, MontyObjectExt},
@@ -210,6 +210,17 @@ impl MontyRepl {
     /// async cancellation flags, before calling [`feed_start`](Self::feed_start).
     pub fn tracker_mut(&mut self) -> &mut ResourceTracker {
         &mut self.heap.tracker
+    }
+
+    /// The memory this session holds, by the deterministic cost table the `max_model_memory` limit uses: every
+    /// live heap object priced from its logical contents, plus one slot for each global.
+    ///
+    /// The number depends only on what the session holds, never on the allocator, the platform or the rest of
+    /// the process, so it is the same on every machine for the same program. It is not a measurement of real
+    /// memory use; see `FORK.md`. Walks the heap, so it costs time proportional to the number of live objects.
+    #[must_use]
+    pub fn model_bytes(&self) -> usize {
+        self.heap.model_bytes() + self.globals.len() * VALUE_BYTES
     }
 
     /// Number of live heap entries (excluding the empty-tuple singleton) —

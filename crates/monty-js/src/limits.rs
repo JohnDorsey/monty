@@ -30,6 +30,11 @@ pub struct JsResourceLimits {
     pub max_turn_steps: Option<f64>,
     /// Maximum heap memory in bytes.
     pub max_memory: Option<f64>,
+    /// Maximum memory in bytes by a fixed cost model of what the session holds: every live object priced from
+    /// its logical size, never from the allocator, so a script stops at the same step on every machine,
+    /// however busy the process is. Exceeding it raises an uncatchable `MemoryError`. May be set beside
+    /// `maxMemory`, which is the allocator-backed measure.
+    pub max_model_memory: Option<f64>,
     /// Run garbage collection every N allocations.
     pub gc_interval: Option<f64>,
     /// Maximum function call stack depth (default: 1000).
@@ -73,6 +78,9 @@ pub fn extract_limits(js_limits: JsResourceLimits) -> Result<ResourceLimits> {
     }
     if let Some(max) = js_limits.max_memory {
         limits = limits.max_memory(js_number_to_usize(max, "maxMemory")?);
+    }
+    if let Some(max) = js_limits.max_model_memory {
+        limits = limits.max_model_memory(js_number_to_usize(max, "maxModelMemory")?);
     }
     if let Some(interval) = js_limits.gc_interval {
         limits = limits.gc_interval(js_number_to_usize(interval, "gcInterval")?);

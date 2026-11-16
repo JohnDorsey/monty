@@ -158,6 +158,18 @@ test('turn duration limit', async () => {
   t.is(await session.feedRun('2 + 2'), 4)
 })
 
+test('the model memory limit stops a runaway at the same point', async () => {
+  const messages: string[] = []
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await using session = await pool().checkout({ limits: { maxModelMemory: 400_000 } })
+    const error = await t.throwsAsync(() => session.feedRun('x = []\nwhile True:\n    x.append([0])\n'), isRuntimeError)
+    t.is(error.exception.typeName, 'MemoryError')
+    t.regex(error.display('msg'), /^model memory limit exceeded: \d+ bytes > 400000 bytes$/)
+    messages.push(error.display('msg'))
+  }
+  t.is(messages[0], messages[1], 'the same count in both workers')
+})
+
 test('step limits stop a runaway loop at the same step', async () => {
   const messages: string[] = []
   for (const scope of ['feed', 'turn'] as const) {

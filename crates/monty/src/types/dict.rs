@@ -11,7 +11,6 @@ use smallvec::smallvec;
 use super::{
     DictItemsView, DictKeysView, DictValuesView, LazyHeapSet, PyTrait, allocate_tuple, list::repr_should_truncate,
 };
-use crate::native_work;
 use crate::{
     args::{ArgValues, FromArgs, KwargsValues},
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
@@ -33,6 +32,7 @@ use crate::{
         },
         copy::{Memo, PyDeepCopy, deep_copy, deep_copy_pair},
     },
+    native_work,
     types::{
         Type, TypeRef,
         hash_table::{

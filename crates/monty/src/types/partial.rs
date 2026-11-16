@@ -56,6 +56,12 @@ pub(crate) struct Partial {
 type PartialParts = (Value, Vec<Value>, Vec<(Value, Value)>);
 
 impl Partial {
+    /// The values the partial holds besides the function: its bound arguments, and a key and value for each
+    /// keyword. For the memory model.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.args.len() + 2 * self.keywords.len()
+    }
+
     /// `functools.partial(func, /, *args, **keywords)`.
     ///
     /// A `func` that is itself a `partial` is flattened: its callable, bound

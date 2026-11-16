@@ -518,6 +518,16 @@ pub struct ResourceLimits {
     pub max_feed_steps: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "10")]
     pub max_turn_steps: ::core::option::Option<u64>,
+    /// Deterministic memory limit in bytes: the session's size by a fixed cost
+    /// table over the logical size of every live object, never read from the
+    /// allocator. A runaway script stops at the same step on every machine,
+    /// whatever else the worker process allocates; `max_memory_bytes` above is
+    /// the allocator-backed measure and may be set beside it. Enforced by the
+    /// worker alone and not echoed. Absent = unlimited. A worker built before
+    /// this field existed ignores it and would run without the limit, so a client
+    /// that sends it declares protocol version 11, which such a worker refuses.
+    #[prost(uint64, optional, tag = "11")]
+    pub max_model_memory: ::core::option::Option<u64>,
 }
 /// Mirrors monty's `OsPolicy`: the clock, zone, sleep, process clock and
 /// initial randomness a session gets, and which of those it asks the host for.

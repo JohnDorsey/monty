@@ -111,6 +111,14 @@ impl<C: ContainsHeap> DropWithContext<C> for ChainSources {
 }
 
 impl Chain {
+    /// The iterables still held as arguments, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        match &self.sources {
+            ChainSources::Args { iterables, .. } => iterables.len(),
+            ChainSources::Outer(_) => 0,
+        }
+    }
+
     /// Takes the arguments unresolved — see the type docs for why.
     pub(crate) fn new(iterables: Vec<Value>) -> Self {
         Self::with_sources(ChainSources::Args { iterables, next: 0 })

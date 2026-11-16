@@ -49,6 +49,7 @@ Monty enforces hard limits on memory, execution time and recursion depth, config
 | Key                      | Meaning                                                                                                                                                                           |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `max_memory`             | Maximum heap memory in bytes                                                                                                                                                      |
+| `max_model_memory`       | Maximum memory in bytes by a fixed cost model, the same on every machine (see [Model memory](#model-memory))                                                                       |
 | `max_feed_duration_secs` | Maximum execution time per `feed_run`, in seconds                                                                                                                                 |
 | `max_turn_duration_secs` | Maximum execution time per host round trip, in seconds                                                                                                                            |
 | `max_recursion_depth`    | Maximum function call stack depth (default 1000)                                                                                                                                  |
@@ -63,7 +64,7 @@ default.
 `gc_interval` omitted or `None` uses the built-in schedule of every 100,000 allocations; collection cannot be turned
 off.
 
-In JavaScript the same fields are `maxMemory`, `maxFeedDurationSecs`, `maxTurnDurationSecs`,
+In JavaScript the same fields are `maxMemory`, `maxModelMemory`, `maxFeedDurationSecs`, `maxTurnDurationSecs`,
 `maxRecursionDepth`, `gcInterval`, `maxSuspensions` and `maxTotalSleepSecs`, passed as `limits` to `pool.checkout()`.
 In Rust they are the fields of [`monty_types::ResourceLimits`](api/rust/monty-types.md#resourcelimits), where the
 durations are `Duration`s named `max_feed_duration`, `max_turn_duration` and `max_total_sleep`.
@@ -92,6 +93,27 @@ So are the value buffers a single call fills: the argument pack behind `f(*args)
 text `json.dumps` and `json.dump` build, the pieces `str.split`, `bytes.split` and `re.split` collect, the matches
 `re.finditer` builds, and the list `re.findall` builds for a pattern with at most one capture group.
 A wider `findall` allocates a tuple per match and is not covered — see [the limitations note](limitations/resource_limits.md).
+
+### Model memory
+
+`max_memory` reads what the whole worker process has asked its allocator for, so the step at which it stops a script moves
+with anything else the process does, and without `monty-alloc` as the global allocator (an embedding in another program)
+it cannot see a loop that keeps many small objects at all.
+`max_model_memory` is the limit to use where a script must stop at the same step on every machine.
+It adds up a fixed price for every live object, from its logical size and never from the allocator: a heap object costs 96
+bytes plus its contents, a list or tuple 16 bytes per item, a dict 72 per entry, a set 40 per element, a string its length,
+an integer 8 per 64-bit word, a global or stack slot 16, and a call frame 128.
+The full table is in `FORK.md`.
+
+The prices are a convention that approximates a 64-bit build, not a measurement: measured, the count ran between 0.75 and
+0.97 of what the allocator saw, mostly because it ignores the spare room in lists grown one push at a time. It ignores
+interned strings and compiled code, and what a call holds only while it runs.
+It is measured at the interpreter's checkpoints, and a script that allocates fast can pass the limit by a few percent
+before it is stopped, more for a heap of hundreds of thousands of objects.
+Exceeding it raises the same uncatchable `MemoryError`, with the message `model memory limit exceeded: N bytes > M bytes`,
+and a request larger than the whole limit is refused before it is made.
+It needs no allocator support, can be set beside `max_memory`, and is carried over the worker protocol; the WebAssembly worker
+does not support it.
 
 A few integer operations carry their own caps regardless of `max_memory`:
 

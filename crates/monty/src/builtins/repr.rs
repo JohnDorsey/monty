@@ -1,7 +1,8 @@
 //! Implementation of the repr() builtin function.
 
-use crate::native_work;
-use crate::{args::ArgValues, bytecode::VM, defer_drop, exception_private::RunResult, types::PyTrait, value::Value};
+use crate::{
+    args::ArgValues, bytecode::VM, defer_drop, exception_private::RunResult, native_work, types::PyTrait, value::Value,
+};
 
 /// Implementation of the repr() builtin function.
 ///

@@ -97,6 +97,12 @@ pub(crate) struct Cli {
     #[arg(long, value_parser = parse_memory_size)]
     max_memory: Option<usize>,
 
+    /// Deterministic memory limit (same units as `--max-memory`): the session's size by a fixed cost table over
+    /// the logical size of every live object, never read from the allocator, so a script stops at the same step
+    /// on every machine. Raises an uncatchable `MemoryError`.
+    #[arg(long, value_parser = parse_memory_size)]
+    max_model_memory: Option<usize>,
+
     /// Run garbage collection every N allocations.
     #[arg(long)]
     gc_interval: Option<usize>,
@@ -170,6 +176,7 @@ impl Cli {
             || self.max_feed_steps.is_some()
             || self.max_turn_steps.is_some()
             || self.max_memory.is_some()
+            || self.max_model_memory.is_some()
             || self.gc_interval.is_some()
             || self.max_recursion_depth.is_some()
             || self.max_suspensions.is_some()
@@ -198,6 +205,9 @@ impl Cli {
         }
         if let Some(bytes) = self.max_memory {
             limits = limits.max_memory(bytes);
+        }
+        if let Some(bytes) = self.max_model_memory {
+            limits = limits.max_model_memory(bytes);
         }
         if let Some(interval) = self.gc_interval {
             limits = limits.gc_interval(interval);

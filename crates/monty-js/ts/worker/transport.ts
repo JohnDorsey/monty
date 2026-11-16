@@ -623,9 +623,13 @@ function componentRandomSeed(seed: EncodedRandomSeed): ComponentRandomSeed {
 
 /** Converts JavaScript-facing limits to canonical WIT integer fields. */
 function encodeLimits(limits: ResourceLimits): ComponentResourceLimits {
-  // The component interface has no step budgets, and dropping one would run the script unbounded.
+  // The component interface has no step budgets and no model memory limit, and dropping one would run the
+  // script unbounded.
   if (limits.maxFeedSteps !== undefined || limits.maxTurnSteps !== undefined) {
     throw new TypeError('maxFeedSteps and maxTurnSteps are not supported by the WebAssembly worker')
+  }
+  if (limits.maxModelMemory !== undefined) {
+    throw new TypeError('maxModelMemory is not supported by the WebAssembly worker')
   }
   return {
     ...micros('maxFeedDurationMicros', 'maxFeedDurationSecs', limits.maxFeedDurationSecs),

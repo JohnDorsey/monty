@@ -80,6 +80,11 @@ pub(crate) struct Decimal {
 }
 
 impl Decimal {
+    /// How many 64-bit words the coefficient occupies, for the memory model.
+    pub(crate) fn coefficient_words(&self) -> usize {
+        self.coeff.limb_count()
+    }
+
     /// The largest finite magnitude the context allows, `prec` nines at `Etop`:
     /// the overflow result when rounding towards zero, and `next_*` from an infinity.
     pub(crate) fn largest_finite(sign: bool, ctx: &Ctx<'_>) -> RunResult<Self> {

@@ -65,6 +65,11 @@ pub(crate) struct TeeBlock {
 }
 
 impl TeeBlock {
+    /// The items read ahead into this block, for the memory model.
+    pub(crate) fn buffered_values(&self) -> usize {
+        self.items.len()
+    }
+
     /// Opens a chain over `source`.
     fn new(source: Value) -> Self {
         Self {

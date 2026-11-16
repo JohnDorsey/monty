@@ -77,6 +77,19 @@ pub(crate) struct ReMatch {
 }
 
 impl ReMatch {
+    /// The bytes of matched and captured text this match owns (the subject is shared, so it is not counted),
+    /// for the memory model.
+    pub(crate) fn text_bytes(&self) -> usize {
+        self.full_match.len()
+            + self.groups.iter().flatten().map(String::len).sum::<usize>()
+            + self.named_groups.iter().map(|(name, _)| name.len()).sum::<usize>()
+    }
+
+    /// How many capture groups the match records, for the memory model.
+    pub(crate) fn group_count(&self) -> usize {
+        self.group_spans.len()
+    }
+
     /// Creates a `ReMatch` from the byte spans of one match: `spans[0]` is the full
     /// match, then one entry per capture group (`None` if it took no part).
     ///

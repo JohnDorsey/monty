@@ -78,6 +78,22 @@ pub fn memory_limit_with_headroom(max_memory: Option<usize>, type_check: bool) -
 /// where operations like `2 ** 10_000_000` allocate huge amounts of memory before
 /// the memory check can catch them.
 pub const LARGE_RESULT_THRESHOLD: usize = 100_000;
+
+/// The fewest steps between two walks of the session for the deterministic memory limit.
+const MODEL_WALK_MIN_INTERVAL: u64 = 256;
+/// A walk visits every heap slot, so walks are spaced at least this many slots per step apart: two slot
+/// visits per step at the most, however close the session sits to its limit.
+const MODEL_WALK_SLOTS_PER_STEP: u64 = 2;
+/// Heap slots one step of the budget pays for when a walk visits them.
+const MODEL_WALK_SLOTS_PER_CHARGED_STEP: usize = 4;
+/// The most an existing buffer grows in a step without the model being told. A push is a call, the value
+/// it pushes and a few loads, five instructions or more for a list (16 bytes) and nine for a dict entry (72),
+/// so a sustained rate is under 8 bytes a step; this allows half as much again. A bound used only to decide
+/// when to walk, so being too low costs precision, never correctness.
+const MODEL_IN_PLACE_BYTES_PER_STEP: u64 = 12;
+/// What is taken on since the last walk, as a fraction of the limit, that makes a walk due at once whatever
+/// the spacing: a bulk allocation is worth measuring as soon as it has happened.
+const MODEL_WALK_BULK_DIVISOR: usize = 8;
 /// Error returned when a resource limit is exceeded during execution.
 ///
 /// This allows the sandbox to enforce strict limits on execution time
@@ -103,6 +119,8 @@ pub enum ResourceError {
     },
     /// Maximum memory usage exceeded.
     Memory { limit: usize, used: usize },
+    /// The deterministic memory limit, [`ResourceLimits::max_model_memory`], was exceeded.
+    ModelMemory { limit: usize, used: usize },
     /// Maximum recursion depth exceeded.
     Recursion { limit: usize, depth: usize },
 }
@@ -142,6 +160,9 @@ impl fmt::Display for ResourceError {
             }
             Self::Memory { limit, used } => {
                 write!(f, "memory limit exceeded: {used} bytes > {limit} bytes")
+            }
+            Self::ModelMemory { limit, used } => {
+                write!(f, "model memory limit exceeded: {used} bytes > {limit} bytes")
             }
             Self::Recursion { .. } => {
                 write!(f, "maximum recursion depth exceeded")
@@ -205,6 +226,12 @@ pub struct ResourceLimits {
     ///
     /// Requires the executable to install and arm `monty-alloc`.
     pub max_memory: Option<usize>,
+    /// Maximum memory in bytes by the deterministic cost model, which prices every live heap object from its
+    /// logical size and never reads the allocator. A script stops at the same step on every machine, however
+    /// busy the process is, and the limit needs no `monty-alloc`. The count is a fixed convention that
+    /// approximates a 64-bit build's real use; see the `FORK.md` section "Model memory".
+    #[serde(default)]
+    pub max_model_memory: Option<usize>,
     /// Run garbage collection every N GC-tracked allocations; `None` uses [`DEFAULT_GC_INTERVAL`].
     pub gc_interval: Option<usize>,
     /// Maximum recursion depth (function call stack depth).
@@ -241,6 +268,7 @@ impl Default for ResourceLimits {
             max_feed_steps: None,
             max_turn_steps: None,
             max_memory: None,
+            max_model_memory: None,
             gc_interval: None,
             max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
             max_suspensions: DEFAULT_MAX_SUSPENSIONS,
@@ -271,6 +299,13 @@ impl ResourceLimits {
     #[must_use]
     pub fn max_memory(mut self, limit: usize) -> Self {
         self.max_memory = Some(limit);
+        self
+    }
+
+    /// Sets the deterministic memory limit in bytes, by the cost model.
+    #[must_use]
+    pub fn max_model_memory(mut self, limit: usize) -> Self {
+        self.max_model_memory = Some(limit);
         self
     }
 
@@ -365,6 +400,20 @@ pub struct ResourceTracker {
     /// executing.
     #[serde(skip)]
     running_since: Cell<Option<ExecutionInstant>>,
+    /// What the model measured at its last walk of the session, in bytes. Serialized, with the rest of the
+    /// measuring schedule, so a restored session is measured exactly as the one that was dumped would be.
+    #[serde(default)]
+    model_used: Cell<usize>,
+    /// Bytes the model has been told were taken on since the last walk. An upper bound on growth: it never
+    /// subtracts what was freed, so it can only trigger a measurement, never a verdict.
+    #[serde(default)]
+    model_pending: Cell<usize>,
+    /// The session's step count at the last walk.
+    #[serde(default)]
+    model_walk_steps: Cell<u64>,
+    /// How many heap slots the last walk visited; the next walk is scheduled in proportion to it.
+    #[serde(default)]
+    model_walk_entries: Cell<usize>,
     /// Optional override applied on top of `limits.max_recursion_depth`.
     ///
     /// `None` (the default — also the value any pre-`test-hooks` snapshot
@@ -389,6 +438,7 @@ impl ResourceTracker {
     /// Callers must check clock compatibility first. This retains the saved clock.
     pub fn tighten_limits(&mut self, ceiling: &ResourceLimits) {
         self.limits.max_memory = tighter_limit(self.limits.max_memory, ceiling.max_memory);
+        self.limits.max_model_memory = tighter_limit(self.limits.max_model_memory, ceiling.max_model_memory);
         self.limits.max_feed_duration = tighter_limit(self.limits.max_feed_duration, ceiling.max_feed_duration);
         self.limits.max_turn_duration = tighter_limit(self.limits.max_turn_duration, ceiling.max_turn_duration);
         self.limits.max_feed_steps = tighter_limit(self.limits.max_feed_steps, ceiling.max_feed_steps);
@@ -423,6 +473,10 @@ impl ResourceTracker {
             feed_steps: Cell::new(0),
             turn_steps: Cell::new(0),
             running_since: Cell::new(None),
+            model_used: Cell::new(0),
+            model_pending: Cell::new(0),
+            model_walk_steps: Cell::new(0),
+            model_walk_entries: Cell::new(0),
             recursion_limit_override: Cell::new(None),
         }
     }
@@ -585,7 +639,10 @@ impl ResourceTracker {
     /// Returns whether the VM has a memory or time limit configured.
     #[must_use]
     pub fn has_memory_time_limit(&self) -> bool {
-        self.limits.max_memory.is_some() || self.has_time_limit() || self.has_step_limit()
+        self.limits.max_memory.is_some()
+            || self.limits.max_model_memory.is_some()
+            || self.has_time_limit()
+            || self.has_step_limit()
     }
 
     /// Returns whether either execution-time budget is configured.
@@ -623,6 +680,23 @@ impl ResourceTracker {
     /// hard allocator limits before execution reaches another checkpoint.
     #[inline]
     pub fn check_allocation(&self, additional: usize) -> Result<(), ResourceError> {
+        self.check_allocator_memory(additional)?;
+        if let Some(limit) = self.limits.max_model_memory {
+            // One request larger than the whole limit can be refused before it is made. A request that merely
+            // would not fit beside what the session already holds is judged at the next measurement instead:
+            // the last one may be stale, and refusing on a stale count could stop a script that fits.
+            let used = self.model_used.get().saturating_add(additional);
+            if additional > limit {
+                return Err(ResourceError::ModelMemory { limit, used });
+            }
+            self.note_model_growth(additional);
+        }
+        Ok(())
+    }
+
+    /// The allocator-backed part of [`check_allocation`](Self::check_allocation).
+    #[inline]
+    fn check_allocator_memory(&self, additional: usize) -> Result<(), ResourceError> {
         if let Some(limit) = self.limits.max_memory {
             let used = probe_memory().saturating_add(additional);
             if used > limit {
@@ -771,12 +845,108 @@ impl ResourceTracker {
     /// [`check_allocation`](Self::check_allocation) for preflights whose
     /// increment may be zero: a push that allocates nothing must not pay for
     /// the usage probe.
+    ///
+    /// Only the allocator-backed limit sees these. The increments come from buffer capacities (a vector
+    /// doubling, a hash table rehashing), which depend on how the buffer got to its size, on the standard
+    /// library and on the platform's table layout, so a limit that must not depend on any of those cannot
+    /// use them. The deterministic memory limit counts a push by its logical size instead.
     #[inline]
     pub fn check_pending_allocation(&self, additional: usize) -> Result<(), ResourceError> {
         if additional == 0 {
             Ok(())
         } else {
-            self.check_allocation(additional)
+            self.check_allocator_memory(additional)
+        }
+    }
+
+    /// Returns the configured deterministic memory limit, if any.
+    #[must_use]
+    pub fn max_model_memory(&self) -> Option<usize> {
+        self.limits.max_model_memory
+    }
+
+    /// Returns whether the deterministic memory limit is configured.
+    #[must_use]
+    #[inline]
+    pub fn has_model_limit(&self) -> bool {
+        self.limits.max_model_memory.is_some()
+    }
+
+    /// What the model counted at its last walk of the session, in bytes. Zero before the first walk, and
+    /// always zero without a [`max_model_memory`](ResourceLimits::max_model_memory) limit, which is the
+    /// only thing that makes the interpreter walk. For the exact current count of a session between feeds,
+    /// ask the session.
+    #[must_use]
+    pub fn model_used(&self) -> usize {
+        self.model_used.get()
+    }
+
+    /// What the session has told the tracker it took on since the last walk, in bytes: an upper bound on its
+    /// growth, never reduced by what was freed.
+    #[must_use]
+    pub fn model_pending(&self) -> usize {
+        self.model_pending.get()
+    }
+
+    /// Records that the session took on `bytes` the model will count: a new heap object, or a buffer
+    /// about to grow. Only a hint that a walk may be due, and so never wrong by being too large.
+    #[inline]
+    pub fn note_model_growth(&self, bytes: usize) {
+        self.model_pending.set(self.model_pending.get().saturating_add(bytes));
+    }
+
+    /// Whether the interpreter should walk the session and report what the model counts, by
+    /// [`record_model_walk`](Self::record_model_walk). Reads only counters, so it is cheap.
+    ///
+    /// A walk is due when what the session could hold now, at the most, is over the limit. That upper bound is
+    /// the last walk's count, plus what the session has since told the tracker it took on (every new heap
+    /// object, every bulk allocation), plus a fixed allowance per step for the one thing it is not told about:
+    /// a push into a buffer that already has room. Frees are not subtracted, so the bound can only be too
+    /// high, which costs a walk that finds nothing, never a missed limit.
+    ///
+    /// Walks are also spaced: at least 256 steps apart, and at least half as many steps as there are heap
+    /// slots, so that walking costs a bounded share of the script's time however large the heap is. The one
+    /// exception is a bulk allocation of an eighth of the limit or more, which is measured as soon as it has
+    /// happened.
+    ///
+    /// All of it is counters the program produced, so a walk falls at the same point on every machine.
+    #[must_use]
+    #[inline]
+    pub fn model_walk_due(&self) -> bool {
+        let Some(limit) = self.limits.max_model_memory else {
+            return false;
+        };
+        let pending = self.model_pending.get();
+        let used = self.model_used.get();
+        if pending >= limit / MODEL_WALK_BULK_DIVISOR && used.saturating_add(pending) > limit {
+            return true;
+        }
+        let since = self.total_steps.get().saturating_sub(self.model_walk_steps.get());
+        let spacing = MODEL_WALK_MIN_INTERVAL
+            .max(u64::try_from(self.model_walk_entries.get()).unwrap_or(u64::MAX) / MODEL_WALK_SLOTS_PER_STEP);
+        if since < spacing {
+            return false;
+        }
+        let in_place = usize::try_from(since.saturating_mul(MODEL_IN_PLACE_BYTES_PER_STEP)).unwrap_or(usize::MAX);
+        used.saturating_add(pending).saturating_add(in_place) > limit
+    }
+
+    /// Records a walk that found the session worth `used` bytes by the model across `entries` heap slots:
+    /// charges the walk to the step count, restarts the schedule, and tests the limit.
+    ///
+    /// # Errors
+    /// Returns [`ResourceError::ModelMemory`] when `used` is over the limit.
+    pub fn record_model_walk(&self, used: usize, entries: usize) -> Result<(), ResourceError> {
+        // One step for every few slots visited, so a script that keeps a large heap near its limit pays for
+        // the measuring in the budget that bounds its work.
+        self.add_steps(u64::try_from(entries / MODEL_WALK_SLOTS_PER_CHARGED_STEP).unwrap_or(u64::MAX));
+        self.model_used.set(used);
+        self.model_pending.set(0);
+        self.model_walk_steps.set(self.total_steps.get());
+        self.model_walk_entries.set(entries);
+        match self.limits.max_model_memory {
+            Some(limit) if used > limit => Err(ResourceError::ModelMemory { limit, used }),
+            _ => Ok(()),
         }
     }
 
