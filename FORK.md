@@ -228,10 +228,13 @@ worker processes behind `monty-pool`, and the Python and JavaScript limits tests
   prints one more "this error originates in the macro" note than the stored snapshots have. This change does not move the
   line numbers those snapshots print (`mod model` is declared at the bottom of `heap/mod.rs` for that reason).
 - The pinned stopping steps of the memory limit (`runaways_stop_at_pinned_steps`) were read on Windows and hold on Linux.
-- Python and JavaScript, run for the first time on 2026-11-16 (`uv sync`, `maturin develop`, `npm install`): on Windows
-  `test_limits.py` 37 passed (the step and memory tests among them) and the whole JavaScript vitest suite passes; the whole
-  Python suite there has 56 failed and 82 errors, all in filesystem, path, mount, zoneinfo and README-example tests, none
-  in limits (Windows environment; see the Linux result in the follow-up note if one was added).
+- Python and JavaScript, run for the first time on 2026-11-16 (`uv sync`, `maturin develop`, `npm install`). On Linux the
+  whole Python suite passes (1,743 passed, 15 skipped) and the whole JavaScript vitest suite passes (772 passed, 3
+  skipped), the step and memory limit tests among them. On Windows `test_limits.py` has 37 passing and the JavaScript suite
+  passes; the whole Python suite there has 56 failed and 82 errors, all in filesystem, path, mount, zoneinfo and
+  README-example tests, none in limits, and none on Linux, so they are the Windows environment.
+- Running the Python suite for the first time found a miss of phase 5: `test_remote.py` kept a snapshot of the accepted
+  limit keys that lacked the step keys. It lists the memory key too now.
 - Mutation experiments on the memory limit's tests: 12 rules broken one at a time, each noticed by at least one test; one
   rule (measure a bulk allocation at once) is noticed only by a unit test, because step charges make it redundant in
   practice. Results are in the Voxunami repository, `docs/history/spikes/scripting/monty_mutation_results_2026-11-16.txt`.

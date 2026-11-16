@@ -572,7 +572,7 @@ async def test_checkout_rejects_unknown_limits():
         with pytest.raises(ValueError) as exc_info:
             pool.checkout(limits={'max_memroy': 10_000_000})  # pyright: ignore[reportArgumentType]
     assert exc_info.value.args[0] == snapshot(
-        "unknown limits key 'max_memroy'; accepted keys are 'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
+        "unknown limits key 'max_memroy'; accepted keys are 'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', 'max_turn_steps', 'max_memory', 'max_model_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
     )
 
 
