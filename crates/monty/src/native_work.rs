@@ -219,7 +219,6 @@ pub(crate) fn method_steps(receiver: &Value, method: Option<StaticStrings>, args
     let (Some(method), Some(receiver)) = (method, operand(receiver, vm)) else {
         return 0;
     };
-    let argument = || positional(args, 0).and_then(|value| operand(value, vm));
     match receiver.kind {
         Kind::Text => match method {
             // O(length of the argument) or settled by `search_steps`.
@@ -246,25 +245,10 @@ pub(crate) fn method_steps(receiver: &Value, method: Option<StaticStrings>, args
             _ => 0,
         },
         Kind::Tuple => 0,
-        Kind::Dict => match method {
-            StaticStrings::Copy => item_steps(receiver.len),
+        // `copy`, `update` and the set algebra copy their tables through code that polls the tracker once per
+        // entry (`hash_table.rs`) or charges the pairs it snapshots (`dict.rs`), so only `clear` is charged here.
+        Kind::Dict | Kind::Set => match method {
             StaticStrings::Clear => moved_steps(receiver.len),
-            // `update` merges through a helper that charges the pairs it snapshots (see `dict.rs`).
-            _ => 0,
-        },
-        Kind::Set => match method {
-            StaticStrings::Copy => item_steps(receiver.len),
-            StaticStrings::Clear => moved_steps(receiver.len),
-            StaticStrings::Union
-            | StaticStrings::Intersection
-            | StaticStrings::Difference
-            | StaticStrings::SymmetricDifference => {
-                item_steps(receiver.len).saturating_add(argument().map_or(0, copy_steps))
-            }
-            StaticStrings::Update => argument().map_or(0, copy_steps),
-            StaticStrings::Isdisjoint | StaticStrings::Issubset | StaticStrings::Issuperset => {
-                item_steps(argument().map_or(receiver.len, |other| other.len.min(receiver.len)))
-            }
             _ => 0,
         },
         Kind::Deque => match method {
@@ -329,8 +313,6 @@ pub(crate) enum Work {
     Add,
     /// `*`: repetition of text, lists or tuples.
     Repeat,
-    /// `|`, `&`, `^`, `-`: a new set built from both operands (dicts charge in their own merge helpers).
-    Combine,
 }
 
 /// Steps to charge for applying `work` to `lhs` and `rhs`. An in-place operator on a list, set or dict
@@ -361,18 +343,6 @@ pub(crate) fn operator_steps(work: Work, lhs: &Value, rhs: &Value, in_place: boo
                 Kind::Text => text_steps(length),
                 Kind::List | Kind::Tuple => item_steps(length),
                 _ => 0,
-            }
-        }
-        Work::Combine => {
-            let (Some(left), Some(right)) = (operand(lhs, vm), operand(rhs, vm)) else {
-                return 0;
-            };
-            // Dict merges charge the pairs they copy in `dict.rs`; sets are charged here.
-            let both = matches!((left.kind, right.kind), (Kind::Set, Kind::Set));
-            match (both, in_place) {
-                (false, _) => 0,
-                (true, true) => item_steps(right.len),
-                (true, false) => item_steps(left.len.saturating_add(right.len)),
             }
         }
     }

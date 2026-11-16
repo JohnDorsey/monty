@@ -22,7 +22,7 @@ use crate::{
     portable_math,
     py_value::PyValue,
     types::{
-        LazyHeapSet, PyTrait, Type,
+        LazyHeapSet, PyTrait, Type, TypeRef,
         str::{StringRepr, allocate_string},
         r#type::strip_underscores,
     },
@@ -445,6 +445,19 @@ impl FromValue for Part {
     }
 }
 
+/// `complex.from_number(...)`.
+pub(crate) fn class_method(
+    attr: &EitherStr,
+    args: ArgValues,
+    vm: &mut VM<'_>,
+) -> Result<RunResult<CallResult>, ArgValues> {
+    if attr.static_string(vm.interns) == Some(StaticStrings::FromNumber) {
+        Ok(class_from_number(vm, args).map(CallResult::Value))
+    } else {
+        Err(args)
+    }
+}
+
 /// `complex.from_number(x)`: a number or complex, never a string.
 pub(crate) fn class_from_number(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("complex.from_number", vm.heap)?;
@@ -571,8 +584,8 @@ impl HeapItem for Complex {
 }
 
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Complex> {
-    fn py_type(&self, _vm: &VM<'h>) -> Type {
-        Type::Complex
+    fn py_type(&self, _vm: &VM<'h>) -> TypeRef {
+        Type::Complex.into()
     }
 
     fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {

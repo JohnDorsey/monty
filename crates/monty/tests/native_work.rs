@@ -120,20 +120,23 @@ fn item_copies_charge_one_step_per_item() {
     assert_charges(tuples, "s + t", 200_000);
     assert_charges(tuples, "s * 2", 200_000);
     let dicts = "s = {i: i for i in range(100000)}\nt = {i: i for i in range(100000)}";
-    assert_charges(dicts, "s.copy()", 100_000);
-    assert_charges(dicts, "dict(s)", 100_000);
+    // Table copies poll the tracker once per entry in blocks of 64, so they come to a few steps under the
+    // length.
+    assert_charges(dicts, "s.copy()", 99_000);
+    assert_charges(dicts, "dict(s)", 99_000);
     assert_charges(dicts, "{**s}", 100_000);
     // A union of two dicts is charged in each helper it passes through: the floor is both operands.
     assert_charges(dicts, "s | t", 200_000);
     // `update` charges the pairs it snapshots, counted a few short of the dict's length.
     assert_charges(dicts, "s.update(t)", 99_000);
     let sets = "s = set(range(100000))\nt = set(range(100000))";
-    assert_charges(sets, "s.copy()", 100_000);
-    assert_charges(sets, "set(s)", 100_000);
-    assert_charges(sets, "frozenset(s)", 100_000);
-    assert_charges(sets, "s.union(t)", 200_000);
-    assert_charges(sets, "s.isdisjoint(t)", 100_000);
-    assert_charges(sets, "s.update(t)", 100_000);
+    assert_charges(sets, "s.copy()", 99_000);
+    assert_charges(sets, "set(s)", 99_000);
+    assert_charges(sets, "frozenset(s)", 99_000);
+    assert_charges(sets, "s.union(t)", 199_000);
+    // `isdisjoint` copies both operands' tables.
+    assert_charges(sets, "s.isdisjoint(t)", 199_000);
+    assert_charges(sets, "s.update(t)", 99_000);
 }
 
 #[test]

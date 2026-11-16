@@ -42,7 +42,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
     }
 
     /// Binary multiplication.
@@ -108,22 +108,22 @@ impl VM<'_> {
 
     /// Binary `&`.
     pub(super) fn binary_and(&mut self) -> Result<(), RunError> {
-        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_and(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_and(rhs, vm))
     }
 
     /// Binary `|`.
     pub(super) fn binary_or(&mut self) -> Result<(), RunError> {
-        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_or(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_or(rhs, vm))
     }
 
     /// Binary `^`.
     pub(super) fn binary_xor(&mut self) -> Result<(), RunError> {
-        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
     }
 
     /// Set symmetric difference mutates the left operand before binary fallback.
     pub(super) fn inplace_xor(&mut self) -> Result<(), RunError> {
-        self.inplace_op(Work::Combine, PyTrait::py_ixor_impl, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
+        self.inplace_op(Work::None, PyTrait::py_ixor_impl, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
     }
 
     /// Binary left shift.
@@ -168,17 +168,17 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.inplace_op(Work::Combine, PyTrait::py_isub_impl, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
+        self.inplace_op(Work::None, PyTrait::py_isub_impl, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
     }
 
     /// `&=` — an in-place mutation (a `Counter` intersects counts), or binary `&`.
     pub(super) fn inplace_and(&mut self) -> Result<(), RunError> {
-        self.inplace_op(Work::Combine, PyTrait::py_iand_impl, |lhs, rhs, vm| lhs.py_and(rhs, vm))
+        self.inplace_op(Work::None, PyTrait::py_iand_impl, |lhs, rhs, vm| lhs.py_and(rhs, vm))
     }
 
     /// `|=` — an in-place mutation (a `Counter` unions counts), or binary `|`.
     pub(super) fn inplace_or(&mut self) -> Result<(), RunError> {
-        self.inplace_op(Work::Combine, PyTrait::py_ior_impl, |lhs, rhs, vm| lhs.py_or(rhs, vm))
+        self.inplace_op(Work::None, PyTrait::py_ior_impl, |lhs, rhs, vm| lhs.py_or(rhs, vm))
     }
 
     /// Binary matrix multiplication (`@` operator).
