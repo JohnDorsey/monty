@@ -543,6 +543,18 @@ impl ResourceTracker {
         self.turn_steps.set(self.turn_steps.get().saturating_add(count));
     }
 
+    /// Records `count` steps for one native operation whose work grows with the size of its operands, and
+    /// tests the step budgets at once. The caller computes `count` from sizes it already knows, so the
+    /// charge is deterministic and the operation is refused before it does its work.
+    ///
+    /// # Errors
+    /// Returns [`ResourceError::Steps`] when a step budget is exceeded.
+    #[inline]
+    pub fn charge_steps(&self, count: u64) -> Result<(), ResourceError> {
+        self.add_steps(count);
+        self.check_steps()
+    }
+
     /// Returns whether either step budget is configured.
     #[must_use]
     #[inline]

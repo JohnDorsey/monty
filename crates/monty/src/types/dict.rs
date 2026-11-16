@@ -11,6 +11,7 @@ use smallvec::smallvec;
 use super::{
     DictItemsView, DictKeysView, DictValuesView, LazyHeapSet, PyTrait, allocate_tuple, list::repr_should_truncate,
 };
+use crate::native_work;
 use crate::{
     args::{ArgValues, FromArgs, KwargsValues},
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
@@ -1837,6 +1838,7 @@ fn dict_merge_from_value(dict: &mut Dict, other_value: Value, vm: &mut VM<'_>) -
 /// fact. The target's own growth is left to the ordinary checkpoints, being
 /// unknowable until the keys are compared.
 fn check_pair_snapshot(len: usize, vm: &VM<'_>) -> RunResult<()> {
+    native_work::charge(vm, native_work::item_steps(len))?;
     Ok(vm.heap.tracker.check_allocation(len.saturating_mul(2 * VALUE_SIZE))?)
 }
 
@@ -1845,6 +1847,7 @@ fn check_pair_snapshot(len: usize, vm: &VM<'_>) -> RunResult<()> {
 /// raises `MemoryError` rather than jumping past the allocator's hard ceiling.
 /// The growth term is exact only because the destination starts empty.
 pub(crate) fn check_pairs_into_fresh_dict(len: usize, vm: &VM<'_>) -> RunResult<()> {
+    native_work::charge(vm, native_work::item_steps(len))?;
     Ok(vm
         .heap
         .tracker

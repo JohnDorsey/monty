@@ -1,6 +1,7 @@
 //! Collection building and unpacking helpers for the VM.
 
 use super::VM;
+use crate::native_work;
 use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
@@ -303,6 +304,12 @@ impl VM<'_> {
         let mapping = this.pop();
         defer_drop!(mapping, this);
 
+        // `{**mapping}` copies the whole mapping between two checkpoints: charge it by its size.
+        if let Value::Ref(id) = mapping
+            && let HeapData::Dict(dict) = this.heap.get(*id)
+        {
+            native_work::charge(this, native_work::item_steps(dict.len()))?;
+        }
         // Clone all key/value pairs out of the mapping before mutating the target dict
         let copied_items: Vec<(Value, Value)> = if let Value::Ref(id) = mapping {
             if let HeapData::Dict(dict) = this.heap.get(*id) {

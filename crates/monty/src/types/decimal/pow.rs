@@ -14,7 +14,7 @@ use super::{
     context::{Condition, DecContext, MAX_EMAX, MIN_EMIN, Rounding},
     trans::{dec_len, dec_len_i64, decimal_lshift_exact, dpower, log10_lb, roundable, ten},
 };
-use crate::exception_private::RunResult;
+use crate::{exception_private::RunResult, native_work};
 
 /// Exponents of exact results are clamped to this magnitude when they do not fit an
 /// `i64`; `fix` then overflows or underflows them as the true value would.
@@ -129,6 +129,9 @@ impl Decimal {
             let mut extra = 3;
             loop {
                 ctx.check_time()?;
+                // Each refinement runs `exp` and `ln` series at the raised working precision.
+                ctx.tracker
+                    .charge_steps(native_work::decimal::transcendental_steps(p + extra))?;
                 let (coeff, exp) = dpower(&xc, xe, &yc, ye, p + extra, ctx)?;
                 if roundable(&coeff, p, ctx)? {
                     break Self::from_bigint_triple(result_sign, &coeff, exp);
@@ -152,6 +155,9 @@ impl Decimal {
         let prec = ctx.settings.prec;
         let wp = self.digits().max(prec).saturating_add(LIBMPDEC_POW_GUARD_DIGITS);
         ctx.check_digits(u64::try_from(wp).unwrap_or(u64::MAX).saturating_mul(2))?;
+        // The refinement loop below runs series and Newton steps at the working precision.
+        ctx.tracker
+            .charge_steps(native_work::decimal::transcendental_steps(prec))?;
         let work = DecContext {
             prec: wp,
             rounding: Rounding::HalfEven,
@@ -315,6 +321,8 @@ impl Decimal {
         }
         let m_u64 = m.to_u64().expect("bounded by the precision");
         ctx.check_digits(m_u64.saturating_mul(xc.bits()) / 3)?;
+        ctx.tracker
+            .charge_steps(native_work::integer::power_steps(m_u64.saturating_mul(xc.bits())))?;
         let xc = Coeff::from_bigint(&Pow::pow(xc, m_u64));
         let xe = xe * &m;
         let len = i64::try_from(xc.digits()).expect("bounded by the memory check");

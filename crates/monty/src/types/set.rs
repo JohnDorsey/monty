@@ -3,6 +3,7 @@ use std::{cell::Cell, fmt::Write, mem};
 use monty_types::{ResourceError, ResourceTracker};
 
 use super::{PyTrait, iter::checked_preallocation_hint};
+use crate::native_work;
 use crate::{
     args::ArgValues,
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
@@ -836,6 +837,7 @@ impl Set {
 /// the allocator's hard ceiling would catch it. The index table it rebuilds is
 /// bounded by those entries, which is why charging them is enough.
 fn clone_storage_checked(storage: &SetStorage, vm: &VM<'_>) -> RunResult<SetStorage> {
+    native_work::charge(vm, native_work::item_steps(storage.len()))?;
     vm.heap
         .tracker
         .check_allocation(storage.len().saturating_mul(mem::size_of::<SetEntry>()))?;

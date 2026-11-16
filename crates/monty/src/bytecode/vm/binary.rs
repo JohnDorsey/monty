@@ -5,6 +5,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     heap::DropGuard,
+    native_work::{self, Work},
     types::{PyTrait, long_int::wide_i128_into_value},
     value::{Value, floor_divmod, py_float_divmod, py_float_mod},
 };
@@ -32,7 +33,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_add(rhs, vm))
+        self.binary_op(Work::Add, |lhs, rhs, vm| lhs.py_add(rhs, vm))
     }
 
     /// Binary subtraction.
@@ -41,7 +42,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_sub(rhs, vm))
+        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
     }
 
     /// Binary multiplication.
@@ -50,12 +51,12 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_mul(rhs, vm))
+        self.binary_op(Work::Repeat, |lhs, rhs, vm| lhs.py_mul(rhs, vm))
     }
 
     /// Tries in-place multiplication, then binary fallback; reflected results may replace the operand.
     pub(super) fn inplace_mult(&mut self) -> Result<(), RunError> {
-        self.inplace_op(PyTrait::py_imul_impl, |lhs, rhs, vm| lhs.py_mul(rhs, vm))
+        self.inplace_op(Work::Repeat, PyTrait::py_imul_impl, |lhs, rhs, vm| lhs.py_mul(rhs, vm))
     }
 
     /// Binary division.
@@ -71,7 +72,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_truediv(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_truediv(rhs, vm))
     }
 
     /// Binary floor division.
@@ -83,7 +84,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_floordiv(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_floordiv(rhs, vm))
     }
 
     /// Binary modulo.
@@ -96,43 +97,43 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.binary_op(|lhs, rhs, vm| lhs.py_mod(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_mod(rhs, vm))
     }
 
     /// Binary power.
     #[inline(never)]
     pub(super) fn binary_pow(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_pow(rhs, None, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_pow(rhs, None, vm))
     }
 
     /// Binary `&`.
     pub(super) fn binary_and(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_and(rhs, vm))
+        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_and(rhs, vm))
     }
 
     /// Binary `|`.
     pub(super) fn binary_or(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_or(rhs, vm))
+        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_or(rhs, vm))
     }
 
     /// Binary `^`.
     pub(super) fn binary_xor(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_xor(rhs, vm))
+        self.binary_op(Work::Combine, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
     }
 
     /// Set symmetric difference mutates the left operand before binary fallback.
     pub(super) fn inplace_xor(&mut self) -> Result<(), RunError> {
-        self.inplace_op(PyTrait::py_ixor_impl, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
+        self.inplace_op(Work::Combine, PyTrait::py_ixor_impl, |lhs, rhs, vm| lhs.py_xor(rhs, vm))
     }
 
     /// Binary left shift.
     pub(super) fn binary_lshift(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_lshift(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_lshift(rhs, vm))
     }
 
     /// Binary right shift.
     pub(super) fn binary_rshift(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_rshift(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_rshift(rhs, vm))
     }
 
     /// In-place addition.
@@ -146,7 +147,7 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.inplace_op(PyTrait::py_iadd_impl, |lhs, rhs, vm| {
+        self.inplace_op(Work::Add, PyTrait::py_iadd_impl, |lhs, rhs, vm| {
             if let Some(value) = lhs.py_add_result(rhs, vm)? {
                 Ok(value)
             } else {
@@ -167,22 +168,22 @@ impl VM<'_> {
             return Ok(());
         }
 
-        self.inplace_op(PyTrait::py_isub_impl, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
+        self.inplace_op(Work::Combine, PyTrait::py_isub_impl, |lhs, rhs, vm| lhs.py_sub(rhs, vm))
     }
 
     /// `&=` — an in-place mutation (a `Counter` intersects counts), or binary `&`.
     pub(super) fn inplace_and(&mut self) -> Result<(), RunError> {
-        self.inplace_op(PyTrait::py_iand_impl, |lhs, rhs, vm| lhs.py_and(rhs, vm))
+        self.inplace_op(Work::Combine, PyTrait::py_iand_impl, |lhs, rhs, vm| lhs.py_and(rhs, vm))
     }
 
     /// `|=` — an in-place mutation (a `Counter` unions counts), or binary `|`.
     pub(super) fn inplace_or(&mut self) -> Result<(), RunError> {
-        self.inplace_op(PyTrait::py_ior_impl, |lhs, rhs, vm| lhs.py_or(rhs, vm))
+        self.inplace_op(Work::Combine, PyTrait::py_ior_impl, |lhs, rhs, vm| lhs.py_or(rhs, vm))
     }
 
     /// Binary matrix multiplication (`@` operator).
     pub(super) fn binary_matmul(&mut self) -> Result<(), RunError> {
-        self.binary_op(|lhs, rhs, vm| lhs.py_matmul(rhs, vm))
+        self.binary_op(Work::None, |lhs, rhs, vm| lhs.py_matmul(rhs, vm))
     }
 
     /// Applies a unary operation while owning stack-value cleanup, raising
@@ -265,6 +266,7 @@ impl VM<'_> {
     /// Applies a binary operation while owning stack-value cleanup.
     fn binary_op(
         &mut self,
+        work: Work,
         operation: impl FnOnce(&Value, &Value, &mut Self) -> RunResult<Value>,
     ) -> Result<(), RunError> {
         let this = self;
@@ -274,6 +276,7 @@ impl VM<'_> {
         let lhs = this.pop();
         defer_drop!(lhs, this);
 
+        native_work::charge(this, native_work::operator_steps(work, lhs, rhs, false, this))?;
         let result = operation(lhs, rhs, this)?;
         this.push(result);
         Ok(())
@@ -287,6 +290,7 @@ impl VM<'_> {
     /// ordinary binary operator produces the result.
     fn inplace_op(
         &mut self,
+        work: Work,
         inplace: impl FnOnce(&mut Value, &Value, &mut Self) -> RunResult<bool>,
         binary: impl FnOnce(&Value, &Value, &mut Self) -> RunResult<Value>,
     ) -> Result<(), RunError> {
@@ -299,6 +303,7 @@ impl VM<'_> {
         let mut lhs_guard = DropGuard::new(this.pop(), this);
         let (lhs, this) = lhs_guard.as_parts_mut();
 
+        native_work::charge(this, native_work::operator_steps(work, lhs, rhs, true, this))?;
         if inplace(lhs, rhs, this)? {
             let (lhs, this) = lhs_guard.into_parts();
             this.push(lhs);

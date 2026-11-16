@@ -33,6 +33,7 @@ use recursion::frame_recursion_depth;
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
 use scheduler::Scheduler;
 
+use crate::native_work;
 use crate::{
     args::ArgValues,
     asyncio::{CallId, TaskId},
@@ -1618,6 +1619,17 @@ impl<'h> VM<'h> {
                     let obj = self.pop();
                     let result = obj.py_getitem(&index, self);
                     obj.drop_with(self);
+                    // A slice copies part of the sequence: charge the step budget for its size.
+                    let result = match result {
+                        Ok(value) => match native_work::charge(self, native_work::slice_steps(&index, &value, self)) {
+                            Ok(()) => Ok(value),
+                            Err(error) => {
+                                value.drop_with(self);
+                                Err(error.into())
+                            }
+                        },
+                        Err(error) => Err(error),
+                    };
                     index.drop_with(self);
                     match result {
                         Ok(v) => self.push(v),

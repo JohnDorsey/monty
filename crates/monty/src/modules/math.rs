@@ -39,7 +39,7 @@ use crate::{
     heap::{HeapData, HeapId},
     intern::StaticStrings,
     modules::ModuleFunctions,
-    portable_math,
+    native_work, portable_math,
     resource_checks::{check_mult_size, check_product_size},
     types::{LongInt, Module, PyTrait, allocate_tuple, decimal, long_int::bigint_to_f64_checked},
     value::Value,
@@ -443,6 +443,9 @@ fn math_isqrt(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     } else if let Some(n) = n.to_i64() {
         Ok(Value::Int(isqrt_i64(n)))
     } else {
+        vm.heap
+            .tracker
+            .charge_steps(native_work::integer::isqrt_steps(n.bits()))?;
         Ok(LongInt::new(BigInt::from(n.magnitude().sqrt())).into_value(vm.heap))
     }
 }
@@ -1080,7 +1083,11 @@ fn math_gcd(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let mut result = BigInt::ZERO;
     for arg in positional.by_ref() {
         defer_drop!(arg, vm);
-        result = result.gcd(&value_to_bigint(arg, vm)?);
+        let operand = value_to_bigint(arg, vm)?;
+        vm.heap
+            .tracker
+            .charge_steps(native_work::integer::gcd_steps(result.bits(), operand.bits()))?;
+        result = result.gcd(&operand);
     }
     Ok(LongInt::new(result).into_value(vm.heap))
 }
@@ -1103,6 +1110,9 @@ fn math_lcm(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
             // `lcm` divides out the gcd, holding a quotient up to `result`'s size, then
             // multiplies: preflight both like `*`.
             check_mult_size(result.bits().saturating_mul(2), n.bits(), &vm.heap.tracker)?;
+            vm.heap
+                .tracker
+                .charge_steps(native_work::integer::gcd_steps(result.bits(), n.bits()))?;
             result = result.lcm(&n);
         } else {
             result = BigInt::ZERO;
@@ -1155,6 +1165,7 @@ fn falling_product(n: &BigInt, k: u64, binomial: bool, tracker: &ResourceTracker
         result_bits = result_bits.min(n);
     }
     check_product_size(result_bits, tracker)?;
+    tracker.charge_steps(native_work::integer::falling_product_steps(k, result_bits))?;
     let mut result = BigInt::one();
     for (polls, i) in (0..k).enumerate() {
         // Nothing here returns to the VM's dispatch checkpoint, so the loop polls the clock itself.

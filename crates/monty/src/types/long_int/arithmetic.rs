@@ -103,7 +103,7 @@ pub(super) trait IntArithmetic {
             if rhs.is_zero() {
                 return Err(ExcType::zero_division().into());
             }
-            check_div_size(lhs.bits(), &vm.heap.tracker)?;
+            check_div_size(lhs.bits(), rhs.bits(), &vm.heap.tracker)?;
             Ok(Some(LongInt::new(lhs.div_floor(rhs)).into_value(vm.heap)))
         } else {
             Ok(None)
@@ -133,6 +133,7 @@ pub(super) trait IntArithmetic {
             if rhs.is_zero() {
                 return Err(ExcType::zero_division().into());
             }
+            check_div_size(lhs.bits(), rhs.bits(), &vm.heap.tracker)?;
             Ok(Some(LongInt::new(lhs.mod_floor(rhs)).into_value(vm.heap)))
         } else {
             Ok(None)
@@ -154,7 +155,7 @@ pub(super) trait IntArithmetic {
             if rhs.is_zero() {
                 return Err(ExcType::zero_division().into());
             }
-            check_div_size(lhs.bits(), &vm.heap.tracker)?;
+            check_div_size(lhs.bits(), rhs.bits(), &vm.heap.tracker)?;
             Ok(Some(bigint_divmod_tuple(lhs, rhs, vm.heap)))
         } else {
             Ok(None)

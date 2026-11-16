@@ -22,7 +22,7 @@ use super::{
     Coeff, Ctx, Decimal, checked_pow10,
     context::{Condition, Rounding},
 };
-use crate::exception_private::RunResult;
+use crate::{exception_private::RunResult, native_work};
 
 impl Decimal {
     /// `sqrt()`: Newton's method on an integer scaled to one digit beyond the precision.
@@ -47,6 +47,7 @@ impl Decimal {
         // digits; `e` starts as the ideal exponent of an exact root.
         let prec = ctx.settings.prec + 1;
         ctx.check_digits(u64::try_from(prec).unwrap_or(u64::MAX).saturating_mul(2))?;
+        ctx.tracker.charge_steps(native_work::decimal::root_steps(prec))?;
         let op_exp = self.exponent();
         let mut e = op_exp.div_euclid(2);
         let (mut c, l) = if op_exp.rem_euclid(2) == 1 {
@@ -109,6 +110,8 @@ impl Decimal {
         // The result is transcendental, so `fix` always raises Inexact and Rounded.
         let p = ctx.settings.prec;
         ctx.check_digits(u64::try_from(p).unwrap_or(u64::MAX).saturating_add(8))?;
+        ctx.tracker
+            .charge_steps(native_work::decimal::transcendental_steps(p))?;
         let adj = self.adjusted();
         let settings = ctx.settings;
         let answer = if !self.sign() && adj > dec_len_i64((settings.emax + 1) * 3) {
@@ -164,6 +167,8 @@ impl Decimal {
         let (c, e) = (self.int(), self.exponent());
         let p = ctx.settings.prec;
         ctx.check_digits(u64::try_from(p).unwrap_or(u64::MAX).saturating_add(8))?;
+        ctx.tracker
+            .charge_steps(native_work::decimal::transcendental_steps(p))?;
         let mut places = p - self.ln_exp_bound(ctx)? + 2;
         let coeff = loop {
             ctx.check_time()?;
@@ -199,6 +204,8 @@ impl Decimal {
             let (c, e) = (self.int(), self.exponent());
             let p = ctx.settings.prec;
             ctx.check_digits(u64::try_from(p).unwrap_or(u64::MAX).saturating_add(8))?;
+            ctx.tracker
+                .charge_steps(native_work::decimal::transcendental_steps(p))?;
             let mut places = p - self.log10_exp_bound(ctx)? + 2;
             let coeff = loop {
                 ctx.check_time()?;

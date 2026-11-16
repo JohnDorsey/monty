@@ -10,8 +10,9 @@ use crate::{
     bytecode::{CallResult, VM},
     exception_private::RunResult,
     frozen::{self, FrozenFunctions},
-    heap::HeapId,
+    heap::{DropWithContext, HeapId},
     intern::StaticStrings,
+    native_work,
 };
 
 pub(crate) mod annotationlib;
@@ -282,6 +283,14 @@ impl ModuleFunctions {
     /// Returns `CallResult` to support both immediate values and OS calls that
     /// require host involvement (e.g., `os.getenv()` needs the host to provide environment variables).
     pub fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
+        // Functions that scan their text or bytes arguments in one native call are charged by those sizes.
+        if self.scans_text_arguments() {
+            let steps = native_work::text_arguments_steps(&args, vm);
+            if let Err(error) = native_work::charge(vm, steps) {
+                args.drop_with(vm);
+                return Err(error.into());
+            }
+        }
         match self {
             Self::Asyncio(functions) => asyncio::call(vm, functions, args),
             Self::Collections(functions) => collections::call(vm, functions, args).map(CallResult::Value),
@@ -313,6 +322,23 @@ impl ModuleFunctions {
             #[cfg(feature = "test-hooks")]
             Self::Sys(functions) => sys::call(vm, functions, args).map(CallResult::Value),
         }
+    }
+
+    /// Whether this function reads the whole of its text or bytes arguments (hashing, encoding, regular
+    /// expressions, parsing) rather than working in time that does not depend on their length.
+    fn scans_text_arguments(self) -> bool {
+        matches!(
+            self,
+            Self::Hashlib(_)
+                | Self::Base64(_)
+                | Self::Binascii(_)
+                | Self::Unicodedata(_)
+                | Self::Re(_)
+                | Self::Json(_)
+                | Self::Fnmatch(_)
+                | Self::Tomllib(_)
+                | Self::Csv(_)
+        )
     }
 
     /// Writes the Python repr() string for this function to a formatter.

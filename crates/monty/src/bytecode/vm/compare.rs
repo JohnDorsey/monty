@@ -7,6 +7,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     expressions::CmpOperator,
+    native_work,
     types::{CmpOrder, PyTrait, long_int::i64_cmp_f64},
     value::Value,
 };
@@ -18,6 +19,15 @@ impl VM<'_> {
     /// than the arbitrary value a direct `==` expression may produce.
     #[inline]
     pub(crate) fn cmp_values(&mut self, op: CmpOperator, lhs: &Value, rhs: &Value) -> RunResult<bool> {
+        let steps = match op {
+            CmpOperator::Eq | CmpOperator::NotEq => native_work::comparison_steps(true, lhs, rhs, self),
+            CmpOperator::Lt | CmpOperator::LtE | CmpOperator::Gt | CmpOperator::GtE => {
+                native_work::comparison_steps(false, lhs, rhs, self)
+            }
+            CmpOperator::In | CmpOperator::NotIn => native_work::membership_steps(rhs, self),
+            CmpOperator::Is | CmpOperator::IsNot => 0,
+        };
+        native_work::charge(self, steps)?;
         match op {
             CmpOperator::Eq | CmpOperator::NotEq => {
                 let result = lhs.py_rich_eq(rhs, self)?;
@@ -47,6 +57,7 @@ impl VM<'_> {
         let lhs = this.pop();
         defer_drop!(lhs, this);
 
+        native_work::charge(this, native_work::comparison_steps(true, lhs, rhs, this))?;
         let result = lhs.py_rich_eq(rhs, this)?;
         this.push(result);
         Ok(())
@@ -64,6 +75,7 @@ impl VM<'_> {
         let lhs = this.pop();
         defer_drop!(lhs, this);
 
+        native_work::charge(this, native_work::comparison_steps(true, lhs, rhs, this))?;
         let result = lhs.py_rich_eq(rhs, this)?;
         defer_drop!(result, this);
         let is_not_equal = !result.py_bool(this)?;

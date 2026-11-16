@@ -24,6 +24,7 @@ mod intern;
 mod modules;
 mod name_map;
 mod namespace;
+mod native_work;
 mod object_bridge;
 mod os_dispatch;
 mod parse;

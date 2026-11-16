@@ -25,6 +25,7 @@ use crate::{
     heap_data::CellValue,
     intern::{FunctionId, StaticStrings, StringId},
     modules::dataclasses,
+    native_work,
     os_dispatch::{PendingEffect, release_pending_effect},
     py_value::PyValue,
     resource_checks::check_estimated_size,
@@ -429,7 +430,39 @@ impl<'h> VM<'h> {
         let args = args_slot.expect("dispatch_dunder returned None without taking args");
 
         defer_drop!(obj, this);
+
+        // Charge the step budget for the size of what the method will touch, before it does the work.
+        let method = this.interns.static_string(name_id);
+        if let Err(error) = native_work::charge(this, native_work::method_steps(obj, method, &args, this)) {
+            args.drop_with(this);
+            return Err(error.into());
+        }
+        if native_work::is_search(method) {
+            return Self::call_search_attr(obj, &attr, method, args, this);
+        }
         obj.py_value(this).py_call_attr(this, &attr, args)
+    }
+
+    /// Calls `find`, `rfind`, `index` or `rindex` on text and charges the step budget for the stretch the
+    /// search scanned: all of it for a miss, up to the hit otherwise. The cost is known only afterwards, so
+    /// the charge follows the call.
+    fn call_search_attr(
+        receiver: &Value,
+        attr: &EitherStr,
+        method: Option<StaticStrings>,
+        args: ArgValues,
+        vm: &mut Self,
+    ) -> Result<CallResult, RunError> {
+        let len = native_work::operand(receiver, vm).map_or(0, |operand| operand.len);
+        let start = native_work::search_start(&args);
+        let forward = matches!(method, Some(StaticStrings::Find | StaticStrings::Index));
+        let result = receiver.py_value(vm).py_call_attr(vm, attr, args);
+        let found_at = match &result {
+            Ok(CallResult::Value(Value::Int(position))) => usize::try_from(*position).ok(),
+            _ => None,
+        };
+        native_work::charge(vm, native_work::search_steps(len, start, found_at, forward))?;
+        result
     }
 
     /// Evaluates a function in a synchronous position that cannot suspend to the host.

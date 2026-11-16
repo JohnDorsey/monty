@@ -43,10 +43,40 @@ repository.
 - The count depends on the bytecode compiler: a Monty release that compiles differently changes every script's count. The
   three pinned counts in `crates/monty/tests/step_budget.rs` (`GOLDEN_STEPS`) show it at once.
 - **Not done yet:** the limits are not carried over the worker pool's wire format (`monty-proto`), so a worker behind
-  `monty-pool` runs without a step budget until phase 5; and the audit of single native operations that do a lot of work
-  in one call (huge powers, sorting, regular expressions) is phase 4.
+  `monty-pool` runs without a step budget until phase 5.
 - Cost, measured on Windows with a release build: tight loops (`fib(27)`, a 5M-iteration loop) within 1 percent of
   unpatched; a callback-heavy sort (300,000 key calls) about 6 percent slower, the price of charging every nested call.
+
+### Native operations that do a lot of work in one call (phase 4)
+
+A loop polls the budget, but one call such as `'x' * 10**8`, `text.upper()`, `list.insert(0, x)`, `a * a` on a big
+integer or `Decimal ** n` at high precision does its work between two polls, so a script could repeat it a million times
+inside a budget. Measured on 2026-11-16 (about 100 operations and about 300 method calls, results in the Voxunami
+repository under `docs/history/spikes/scripting/`): a plain instruction costs about 4 ns a step, and these operations
+cost 1 to 3,000,000 ns per step before the charges. `crates/monty/src/native_work.rs` charges each one, before it does
+its work, from sizes known in constant time, so the charge is the same on every machine:
+
+- text and bytes: 1 step per 16 bytes. Methods, `+`, `*`, comparisons, slices, `hash`, `repr`, and the text arguments of
+  `hashlib`, `base64`, `binascii`, `unicodedata`, `re`, `json`, `fnmatch`, `tomllib`, `csv`. A search (`find`, `index`,
+  `rfind`, `rindex`) is charged after the call for the stretch it scanned; `in` on text charges the whole haystack;
+- containers: 1 step per item copied or hashed (`copy`, `a + b`, `a * n`, `set(s)`, `{**d}`, set algebra); 1 step per 16
+  items moved (`insert`, `pop(i)`, `reverse`, `clear`, `deque.rotate`);
+- big integers, in 64-bit limbs on every platform: `limbs_a * limbs_b / 1024` for `*` and `**`; quotient limbs times
+  divisor limbs over 256 for `//`, `%`, `divmod`; `limbs^2 / 8` for `gcd`; `/ 128` for `isqrt`; per exponent bit
+  `modulus_limbs^2 / 128` for three-argument `pow` (which now also stops partway when a budget runs out); a shift costs
+  1 step per 16 limbs; `comb` and `perm` charge `k * limbs / 32`;
+- `Decimal`: `p^2 * isqrt(p) / 600` for `exp`, `ln`, `log10` and powers, `p^2 / 2000` for `sqrt` (p = the context
+  precision), which is what 250 to 2000 digits measured and what 20,000 digits confirmed: a power at precision 20,000
+  took 15.6 s for 94 million steps, 166 ns each.
+
+Sizes below a rate divide down to zero, so ordinary scripts keep exactly the counts they had (the golden counts in
+`tests/step_budget.rs` did not move). Tests: `tests/native_work.rs`, `native_work_numbers.rs`, `native_work_decimal.rs`;
+each failed before its charge existed.
+
+Known gaps: `re.sub` on a large string takes more than linear time (1 MB about 2 s, 4 MB 40 to 70 s) for a reason not
+found, probably in `fancy-regex` or its `captures_iter`; the text charge makes a budget stop a loop of such calls, but one
+huge call cannot be interrupted. List and tuple slices, `bytes` slices, `list.index`, `sorted` and similar already polled
+per item and are not charged twice.
 
 ## What is deliberately not changed
 

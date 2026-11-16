@@ -32,6 +32,7 @@ use crate::{
     heap::{Heap, HeapData, HeapObjectRead},
     identity::Identity,
     intern::LongIntId,
+    native_work,
     resource_checks::{check_div_size, check_lshift_size, check_mult_size, check_pow_size},
     types::{
         LazyHeapSet, PyTrait, Type,
@@ -1014,10 +1015,13 @@ pub(crate) fn modular_pow(base: &BigInt, exponent: &Value, modulus: &Value, vm: 
     // A `num-bigint` digit is pointer-sized, so wasm32 counts twice as many words.
     let words = modulus_mag.bits().div_ceil(u64::from(usize::BITS));
     let work = exponent.bits().saturating_mul(words.saturating_mul(words));
+    // The step charge counts 64-bit limbs on every platform, unlike `words` above.
+    let bit_steps = native_work::integer::modular_power_bit_steps(modulus_mag.bits());
     let result = if work <= MODPOW_UNPOLLED_WORK {
+        heap.tracker.charge_steps(exponent.bits().saturating_mul(bit_steps))?;
         base.modpow(exponent, modulus_mag)
     } else {
-        polled_modpow(base, exponent, modulus_mag, &heap.tracker)?
+        polled_modpow(base, exponent, modulus_mag, bit_steps, &heap.tracker)?
     };
     let mut result = BigInt::from(result);
     if modulus.is_negative() && !result.is_zero() {
@@ -1037,10 +1041,12 @@ fn polled_modpow(
     base: &BigUint,
     exponent: &BigUint,
     modulus: &BigUint,
+    bit_steps: u64,
     tracker: &ResourceTracker,
 ) -> RunResult<BigUint> {
     let mut result = BigUint::one() % modulus;
     for bit in (0..exponent.bits()).rev() {
+        tracker.charge_steps(bit_steps)?;
         tracker.check_time()?;
         result = &result * &result % modulus;
         if exponent.bit(bit) {
@@ -1135,7 +1141,7 @@ pub(crate) fn bigint_true_divide(a: &BigInt, b: &BigInt, tracker: &ResourceTrack
         } else {
             2 * (bits(b) + shift)
         };
-        check_div_size(temporary_bits.unsigned_abs(), tracker)?;
+        check_div_size(temporary_bits.unsigned_abs(), bits(b).unsigned_abs(), tracker)?;
         let (quotient, remainder) = if shift <= 0 {
             (a << shift.unsigned_abs()).div_rem(b)
         } else {

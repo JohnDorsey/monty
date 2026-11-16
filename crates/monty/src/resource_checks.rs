@@ -4,6 +4,7 @@ use monty_types::{ExcType, LARGE_RESULT_THRESHOLD, ResourceError, ResourceTracke
 use crate::{
     bytecode::VM,
     exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
+    native_work,
     value::{VALUE_SIZE, Value},
 };
 
@@ -55,6 +56,7 @@ pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &ResourceTracker) 
         return Ok(());
     }
     let result_bytes = estimate_bits_to_bytes(base_bits.saturating_mul(exponent));
+    tracker.charge_steps(native_work::integer::power_steps(base_bits.saturating_mul(exponent)))?;
     // Repeated squaring needs ~4× result size in peak memory because old/new base and
     // old/new accumulator coexist during each multiplication step.
     check_estimated_size(result_bytes.saturating_mul(4), tracker)
@@ -66,6 +68,7 @@ pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &ResourceTracker) 
 /// The estimate is doubled because the last multiplication holds its operands, which
 /// together are about the result's size, alongside the result itself.
 pub fn check_product_size(result_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
+    tracker.charge_steps(native_work::integer::power_steps(result_bits))?;
     check_estimated_size(estimate_bits_to_bytes(result_bits).saturating_mul(2), tracker)
 }
 
@@ -73,6 +76,7 @@ pub fn check_product_size(result_bits: u64, tracker: &ResourceTracker) -> Result
 ///
 /// The result of multiplying two numbers has at most `a_bits + b_bits` bits.
 pub fn check_mult_size(a_bits: u64, b_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
+    tracker.charge_steps(native_work::integer::multiply_steps(a_bits, b_bits))?;
     check_estimated_size(estimate_bits_to_bytes(a_bits.saturating_add(b_bits)), tracker)
 }
 
@@ -84,6 +88,9 @@ pub fn check_lshift_size(value_bits: u64, shift_amount: u64, tracker: &ResourceT
     if value_bits == 0 {
         return Ok(());
     }
+    tracker.charge_steps(native_work::integer::shift_steps(
+        value_bits.saturating_add(shift_amount),
+    ))?;
     check_estimated_size(estimate_bits_to_bytes(value_bits.saturating_add(shift_amount)), tracker)
 }
 
@@ -91,7 +98,8 @@ pub fn check_lshift_size(value_bits: u64, shift_amount: u64, tracker: &ResourceT
 ///
 /// Division results are bounded by the dividend size, but we still check for consistency
 /// with other BigInt promotion paths.
-pub fn check_div_size(dividend_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
+pub fn check_div_size(dividend_bits: u64, divisor_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
+    tracker.charge_steps(native_work::integer::divide_steps(dividend_bits, divisor_bits))?;
     check_estimated_size(estimate_bits_to_bytes(dividend_bits), tracker)
 }
 

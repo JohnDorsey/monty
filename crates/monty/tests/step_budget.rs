@@ -4,6 +4,8 @@
 //! These tests read the count at a host call (`probe()`), so they work without a limit set, and they use a
 //! time limit only as a safety net so that a broken counter fails an assertion instead of hanging.
 
+mod step_support;
+
 use std::{
     hint,
     sync::{
@@ -11,68 +13,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
 };
 
-use monty::{MontyRun, RunProgress};
-use monty_types::{CompileOptions, ExcType, MontyException, MontyObject, PrintWriter, ResourceLimits, ResourceTracker};
-
-/// A time limit so long that only a broken step counter ever meets it, short enough that a failing test ends.
-const SAFETY_NET: Duration = Duration::from_secs(20);
-
-/// What the tracker said at one `probe()` call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reading {
-    session: u64,
-    feed: u64,
-    turn: u64,
-}
-
-/// Runs `code`, which may call the host function `probe()`, and returns every reading, or the error.
-fn run_probed(code: &str, limits: ResourceLimits) -> Result<Vec<Reading>, MontyException> {
-    let runner = MontyRun::new(
-        code.to_owned(),
-        "step_budget.py",
-        vec!["probe".to_owned()],
-        CompileOptions::default(),
-    )?;
-    let tracker = ResourceTracker::new(limits);
-    let mut progress = runner.start(
-        vec![MontyObject::function("probe".to_owned(), None)],
-        tracker,
-        PrintWriter::Disabled,
-    )?;
-    let mut readings = Vec::new();
-    loop {
-        match progress {
-            RunProgress::FunctionCall(mut call) => {
-                let tracker = call.tracker_mut();
-                readings.push(Reading {
-                    session: tracker.steps(),
-                    feed: tracker.feed_steps(),
-                    turn: tracker.turn_steps(),
-                });
-                progress = call.resume(MontyObject::none(), PrintWriter::Disabled)?;
-            }
-            RunProgress::Complete(_) => return Ok(readings),
-            other => panic!("unexpected progress: {other:?}"),
-        }
-    }
-}
-
-fn limits() -> ResourceLimits {
-    ResourceLimits::default().max_feed_duration(SAFETY_NET)
-}
-
-/// Asserts that `error` is the step-limit error of the given scope word ("feed" or "turn").
-fn assert_step_error(error: &MontyException, scope: &str) {
-    assert_eq!(error.exc_type(), ExcType::TimeoutError, "{error}");
-    let message = error.message().unwrap_or_default();
-    assert!(
-        message.starts_with(&format!("{scope} step limit exceeded: ")),
-        "expected a {scope} step limit error, got: {message}"
-    );
-}
+use step_support::{assert_step_error, limits, run_probed};
 
 /// A script that mixes the interpreter's main kinds of work: loops, calls, containers, strings and a callback.
 const MIXED: &str = "
