@@ -83,6 +83,16 @@ pub(crate) struct Cli {
     #[arg(long)]
     max_turn_duration: Option<f64>,
 
+    /// Maximum deterministic steps for a single feed: one per bytecode instruction
+    /// or equivalent unit of native work, so a script stops at the same point on
+    /// every machine. Raises an uncatchable `TimeoutError`.
+    #[arg(long)]
+    max_feed_steps: Option<u64>,
+
+    /// Maximum deterministic steps between host round trips (see `--max-feed-steps`).
+    #[arg(long)]
+    max_turn_steps: Option<u64>,
+
     /// Maximum heap memory (e.g. `1024`, `512KB`, `10MB`, `1GB`).
     #[arg(long, value_parser = parse_memory_size)]
     max_memory: Option<usize>,
@@ -157,6 +167,8 @@ impl Cli {
     fn any_resource_limit_flag(&self) -> bool {
         self.max_feed_duration.is_some()
             || self.max_turn_duration.is_some()
+            || self.max_feed_steps.is_some()
+            || self.max_turn_steps.is_some()
             || self.max_memory.is_some()
             || self.gc_interval.is_some()
             || self.max_recursion_depth.is_some()
@@ -177,6 +189,12 @@ impl Cli {
         }
         if let Some(secs) = self.max_turn_duration {
             limits = limits.max_turn_duration(duration_flag(secs, "--max-turn-duration")?);
+        }
+        if let Some(steps) = self.max_feed_steps {
+            limits = limits.max_feed_steps(steps);
+        }
+        if let Some(steps) = self.max_turn_steps {
+            limits = limits.max_turn_steps(steps);
         }
         if let Some(bytes) = self.max_memory {
             limits = limits.max_memory(bytes);

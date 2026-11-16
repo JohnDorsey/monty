@@ -518,6 +518,19 @@ pub struct ResourceLimits {
     /// Cumulative budget for system sleeps, enforced by the client.
     #[prost(uint64, optional, tag = "8")]
     pub max_total_sleep_micros: ::core::option::Option<u64>,
+    /// Per-feed and per-turn budgets of deterministic steps, with the same reset
+    /// points as the two execution budgets above. A step is one bytecode
+    /// instruction or an equivalent unit of native work, so the count depends
+    /// only on the program and its inputs: a script stops at the same point on
+    /// every machine, unlike a time budget. Enforced by the worker alone; unlike
+    /// the execution budgets there is no client-side backstop and the worker does
+    /// not echo them. Absent = unlimited. A worker built before these fields
+    /// existed ignores them and would run without the budget, so a client that
+    /// sends them declares protocol version 10, which such a worker refuses.
+    #[prost(uint64, optional, tag = "9")]
+    pub max_feed_steps: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "10")]
+    pub max_turn_steps: ::core::option::Option<u64>,
 }
 /// Mirrors monty's `OsPolicy`: the clock, zone, sleep, process clock and
 /// initial randomness a session gets, and which of those it asks the host for.

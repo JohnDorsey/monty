@@ -42,8 +42,7 @@ repository.
   change still loads (the fields have defaults).
 - The count depends on the bytecode compiler: a Monty release that compiles differently changes every script's count. The
   three pinned counts in `crates/monty/tests/step_budget.rs` (`GOLDEN_STEPS`) show it at once.
-- **Not done yet:** the limits are not carried over the worker pool's wire format (`monty-proto`), so a worker behind
-  `monty-pool` runs without a step budget until phase 5.
+- **Over the wire (phase 5):** see "Step budgets over the worker protocol" below.
 - Cost, measured on Windows with a release build: tight loops (`fib(27)`, a 5M-iteration loop) within 1 percent of
   unpatched; a callback-heavy sort (300,000 key calls) about 6 percent slower, the price of charging every nested call.
 
@@ -77,6 +76,41 @@ Known gaps: `re.sub` on a large string takes more than linear time (1 MB about 2
 found, probably in `fancy-regex` or its `captures_iter`; the text charge makes a budget stop a loop of such calls, but one
 huge call cannot be interrupted. List and tuple slices, `bytes` slices, `list.index`, `sorted` and similar already polled
 per item and are not charged twice.
+
+### Step budgets over the worker protocol (phase 5)
+
+`monty-pool` drives worker processes over the protobuf protocol of `monty-proto`, so the budgets have to cross it.
+
+- `ResourceLimits` in `monty.proto` gains `optional uint64 max_feed_steps = 9` and `max_turn_steps = 10`; unset means
+  unlimited, and an unset field is not encoded, so a client that sets neither sends the bytes it always did. The
+  checked-in generated code (`src/generated`, `tests/oracle`) is regenerated with `make generate-proto`, which needs a
+  nightly rustfmt for the import style.
+- The worker enforces the budgets alone. There is no client-side backstop and no echo on `WorkerEvent`: a step budget is
+  deterministic, so there is nothing for the pool to supervise the way it supervises a time budget on a stalled worker.
+  A restored session keeps the budget in its dump and the worker's own `Configure` can only tighten it.
+- `PROTOCOL_VERSION` is 10 (upstream main uses 9 for an unrelated change). Only the worker checks versions, so this is
+  what makes an old worker refuse a new client: an old worker would otherwise ignore the unknown fields and run the script
+  with no step budget at all. `MIN_SUPPORTED_PROTOCOL_VERSION` stays 7. **If upstream later uses 10 for something else,
+  renumber ours when merging**, and keep the rule that a client sending step limits must declare a version that a worker
+  without them rejects.
+- Options: `--max-feed-steps` and `--max-turn-steps` on the standalone `monty` CLI; `max_feed_steps` and `max_turn_steps` in
+  the Python `ResourceLimits` dict; `maxFeedSteps` and `maxTurnSteps` in the JavaScript `ResourceLimits`.
+- **Not supported:** the WebAssembly component interface (WIT) has no step fields, so a wasm session runs without them;
+  the JavaScript wasm transport throws if either is set rather than dropping it.
+- Tests: wire round trip and field independence (`monty-proto/tests/roundtrip.rs`); a configured worker stops a runaway
+  feed, two workers stop at the same count, a restored session keeps and can only tighten its budget
+  (`monty-proto/tests/dispatch.rs`); two real worker processes through `monty-pool` stop a script at the same step
+  (`monty-pool/tests/pool_test.rs`). The Python and JavaScript tests were written but not run (they need the extension
+  and node builds).
+
+## Tracking upstream
+
+The branch was cut from the `v1.6.0` tag. Upstream `main` had moved 36 commits by 2026-11-16 with no newer release tag.
+`catch-up-upstream-main` merges it (three small conflicts) and the golden step counts did not move, so the compiler is
+unchanged. One thing the merge changed: upstream's new shared table copy (`hash_table.rs`, `copy_table`) polls the
+tracker once per entry, so the method-level charges for dict and set copies and set algebra were dropped there to avoid
+counting them twice; on the `v1.6.0` line they are still needed. Count drift is the risk of following upstream: watch
+`GOLDEN_STEPS` in `tests/step_budget.rs` at every merge.
 
 ## What is deliberately not changed
 

@@ -165,6 +165,18 @@ class ResourceLimits(TypedDict, total=False):
 
     A snippet that calls out to the host may run longer than this in total."""
 
+    max_feed_steps: int | None
+    """Maximum deterministic steps for a single feed.
+
+    A step is one bytecode instruction, or an equivalent unit of native work (one item of a loop, 16 bytes of
+    text, a size-based charge for big integers and high-precision decimals). Unlike a time limit the count
+    depends only on the program and its inputs, so a script stops at the same point on every machine and
+    under any load. Exceeding it raises an uncatchable `TimeoutError`. The count belongs to the Monty
+    release: a release that compiles differently changes every script's count."""
+
+    max_turn_steps: int | None
+    """Maximum deterministic steps between host round trips; see `max_feed_steps`."""
+
     max_memory: int | None
     """Maximum heap memory in bytes."""
 

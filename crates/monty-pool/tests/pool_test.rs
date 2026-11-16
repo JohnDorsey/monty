@@ -3438,6 +3438,82 @@ async fn max_turn_duration_bounds_a_runaway_turn() {
     assert_eq!(pool.idle_workers(), 1);
 }
 
+/// The step budgets travel over the wire to a real worker process. The per-feed budget restarts at each
+/// feed, so a session survives any number of short feeds and the worker is never killed; a runaway feed ends
+/// in the sandbox with the uncatchable `TimeoutError` of that scope.
+#[tokio::test]
+async fn step_budgets_bound_each_feed_of_a_pooled_worker() {
+    for (scope, limits) in [
+        ("feed", ResourceLimits::default().max_feed_steps(100_000)),
+        ("turn", ResourceLimits::default().max_turn_steps(100_000)),
+    ] {
+        let pool = Pool::new(config()).await.unwrap();
+        let mut session = pool
+            .checkout(&ReplConfig {
+                limits: Some(limits),
+                ..ReplConfig::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let event = session
+                .feed("1 + 1", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap();
+            assert_eq!(expect_complete(event), MontyObject::int(2));
+        }
+        let err = session
+            .feed("while True:\n    pass", vec![], vec![], false, &mut no_print)
+            .await
+            .unwrap_err();
+        let PoolError::Runtime(exc) = err else {
+            panic!("{scope}: expected Runtime, got {err:?}");
+        };
+        assert_eq!(exc.exc_type().to_string(), "TimeoutError");
+        let message = exc.message().unwrap_or_default().to_owned();
+        assert!(
+            message.starts_with(&format!("{scope} step limit exceeded: ")) && message.ends_with("> 100000 steps"),
+            "{message}"
+        );
+        // The session survived, so the budget really did restart.
+        let event = session
+            .feed("2 + 2", vec![], vec![], false, &mut no_print)
+            .await
+            .unwrap();
+        assert_eq!(expect_complete(event), MontyObject::int(4));
+        session.finish().await.unwrap();
+        assert_eq!(pool.idle_workers(), 1);
+    }
+}
+
+/// Two separate worker processes stop the same script at the same step count: the property a time limit
+/// cannot give.
+#[tokio::test]
+async fn a_step_budget_stops_separate_workers_at_the_same_step() {
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        let pool = Pool::new(config()).await.unwrap();
+        let mut session = pool
+            .checkout(&ReplConfig {
+                limits: Some(ResourceLimits::default().max_turn_steps(77_777)),
+                ..ReplConfig::default()
+            })
+            .await
+            .unwrap();
+        let err = session
+            .feed("x = 0\nwhile True:\n    x += 1", vec![], vec![], false, &mut no_print)
+            .await
+            .unwrap_err();
+        let PoolError::Runtime(exc) = err else {
+            panic!("expected Runtime, got {err:?}");
+        };
+        messages.push(exc.message().unwrap_or_default().to_owned());
+        session.finish().await.unwrap();
+    }
+    assert!(messages[0].ends_with("> 77777 steps"), "{}", messages[0]);
+    assert_eq!(messages[0], messages[1]);
+}
+
 /// Budgets near `Duration::MAX` must not overflow the client's backstop
 /// arithmetic (remaining budget plus grace), in either scope.
 #[tokio::test]

@@ -158,6 +158,21 @@ test('turn duration limit', async () => {
   t.is(await session.feedRun('2 + 2'), 4)
 })
 
+test('step limits stop a runaway loop at the same step', async () => {
+  const messages: string[] = []
+  for (const scope of ['feed', 'turn'] as const) {
+    const limits = scope === 'feed' ? { maxFeedSteps: 50_000 } : { maxTurnSteps: 50_000 }
+    await using session = await pool().checkout({ limits })
+    const error = await t.throwsAsync(() => session.feedRun('while True:\n    pass\n'), isRuntimeError)
+    t.is(error.exception.typeName, 'TimeoutError')
+    t.regex(error.display('msg'), new RegExp(`^${scope} step limit exceeded: \\d+ steps > 50000 steps$`))
+    messages.push(error.display('msg').replace(scope, ''))
+    // The budget restarts with the next feed.
+    t.is(await session.feedRun('2 + 2'), 4)
+  }
+  t.is(messages[0], messages[1], 'the same count in both scopes')
+})
+
 // =============================================================================
 // Suspension limit tests
 // =============================================================================

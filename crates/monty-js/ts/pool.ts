@@ -152,6 +152,14 @@ export interface ResourceLimits {
   maxFeedDurationSecs?: number
   /** Maximum execution time between host round trips. */
   maxTurnDurationSecs?: number
+  /**
+   * Maximum deterministic steps for a single feed: one per bytecode instruction or equivalent unit of native
+   * work, so a script stops at the same point on every machine and under any load. Exceeding it raises an
+   * uncatchable `TimeoutError`. Not supported by the WebAssembly worker, which throws instead of ignoring it.
+   */
+  maxFeedSteps?: number
+  /** Maximum deterministic steps between host round trips; see `maxFeedSteps`. */
+  maxTurnSteps?: number
   maxMemory?: number
   gcInterval?: number
   maxRecursionDepth?: number

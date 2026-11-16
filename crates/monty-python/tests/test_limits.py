@@ -37,6 +37,21 @@ def test_resource_limits_typed_dict():
     assert limits.get('max_suspensions') == snapshot(20)
 
 
+def test_step_limits_stop_a_runaway_loop_at_the_same_step(monty_run: RunMonty):
+    """The step limits reach the interpreter and stop a script at a count, not a time."""
+    messages = []
+    for _ in range(2):
+        with pytest.raises(MontyRuntimeError) as exc_info:
+            monty_run('while True:\n    pass', limits={'max_turn_steps': 50_000})
+        messages.append(str(exc_info.value))
+    assert 'turn step limit exceeded' in messages[0]
+    assert '> 50000 steps' in messages[0]
+    assert messages[0] == messages[1]
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run('while True:\n    pass', limits={'max_feed_steps': 50_000})
+    assert 'feed step limit exceeded' in str(exc_info.value)
+
+
 def test_resource_limits_repr():
     limits = ResourceLimits(max_feed_duration_secs=1.0)
     assert repr(limits) == snapshot("{'max_feed_duration_secs': 1.0}")
@@ -175,8 +190,8 @@ def test_limits_unknown_key_raises_error(pool: Monty):
             pass
     assert exc_info.value.args[0] == snapshot(
         "unknown limits key 'max_memroy'; accepted keys are "
-        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', "
-        "'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
+        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', 'max_turn_steps', "
+        "'max_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
     )
 
 
@@ -186,8 +201,8 @@ def test_limits_non_string_key_raises_error(pool: Monty):
             pass
     assert exc_info.value.args[0] == snapshot(
         'unknown limits key 1; accepted keys are '
-        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', "
-        "'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
+        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', 'max_turn_steps', "
+        "'max_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
     )
 
 
@@ -201,8 +216,8 @@ def test_limits_unprintable_key_still_raises_value_error(pool: Monty):
             pass
     assert exc_info.value.args[0] == snapshot(
         'unknown limits key <unprintable key>; accepted keys are '
-        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', "
-        "'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
+        "'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', 'max_turn_steps', "
+        "'max_memory', 'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
     )
 
 

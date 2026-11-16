@@ -22,6 +22,12 @@ pub struct JsResourceLimits {
     pub max_feed_duration_secs: Option<f64>,
     /// Maximum execution time for a single host turn, in seconds.
     pub max_turn_duration_secs: Option<f64>,
+    /// Maximum deterministic steps for a single feed: one per bytecode instruction or equivalent unit of
+    /// native work, so a script stops at the same point on every machine. Exceeding it raises an
+    /// uncatchable `TimeoutError`.
+    pub max_feed_steps: Option<f64>,
+    /// Maximum deterministic steps for a single host turn; see `maxFeedSteps`.
+    pub max_turn_steps: Option<f64>,
     /// Maximum heap memory in bytes.
     pub max_memory: Option<f64>,
     /// Run garbage collection every N allocations.
@@ -58,6 +64,12 @@ pub fn extract_limits(js_limits: JsResourceLimits) -> Result<ResourceLimits> {
     }
     if let Some(secs) = js_limits.max_turn_duration_secs {
         limits = limits.max_turn_duration(js_number_to_duration(secs)?);
+    }
+    if let Some(steps) = js_limits.max_feed_steps {
+        limits = limits.max_feed_steps(js_number_to_u64(steps, "maxFeedSteps")?);
+    }
+    if let Some(steps) = js_limits.max_turn_steps {
+        limits = limits.max_turn_steps(js_number_to_u64(steps, "maxTurnSteps")?);
     }
     if let Some(max) = js_limits.max_memory {
         limits = limits.max_memory(js_number_to_usize(max, "maxMemory")?);

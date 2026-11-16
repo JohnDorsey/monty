@@ -379,6 +379,9 @@ fn configure_from_component(request: ConfigureRequest) -> pb::Configure {
             max_recursion_depth: limits.max_recursion_depth,
             max_suspensions: limits.max_suspensions,
             max_total_sleep_micros: limits.max_total_sleep_micros,
+            // The component interface (WIT) has no step budgets: a wasm session runs without them.
+            max_feed_steps: None,
+            max_turn_steps: None,
         }),
         type_check: request.type_check,
         type_check_stubs: request.type_check_stubs,

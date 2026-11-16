@@ -25,6 +25,8 @@ impl From<&ResourceLimits> for pb::ResourceLimits {
             max_total_sleep_micros: limits
                 .max_total_sleep
                 .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+            max_feed_steps: limits.max_feed_steps,
+            max_turn_steps: limits.max_turn_steps,
         }
     }
 }
@@ -34,10 +36,8 @@ impl From<pb::ResourceLimits> for ResourceLimits {
         Self {
             max_feed_duration: limits.max_feed_duration_micros.map(Duration::from_micros),
             max_turn_duration: limits.max_turn_duration_micros.map(Duration::from_micros),
-            // The step budgets are not on the wire yet (step-budget plan, phase 5): a worker behind the pool
-            // runs without one until they are.
-            max_feed_steps: None,
-            max_turn_steps: None,
+            max_feed_steps: limits.max_feed_steps,
+            max_turn_steps: limits.max_turn_steps,
             max_memory: usize_field(limits.max_memory_bytes),
             gc_interval: usize_field(limits.gc_interval),
             max_recursion_depth: usize_field(limits.max_recursion_depth).unwrap_or(DEFAULT_MAX_RECURSION_DEPTH),

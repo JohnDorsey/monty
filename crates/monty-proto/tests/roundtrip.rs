@@ -643,8 +643,8 @@ fn resource_limits_round_trip() {
     let limits = ResourceLimits {
         max_feed_duration: Some(Duration::from_millis(900)),
         max_turn_duration: Some(Duration::from_millis(250)),
-        max_feed_steps: None,
-        max_turn_steps: None,
+        max_feed_steps: Some(123_456_789),
+        max_turn_steps: Some(4_567),
         max_memory: Some(64 * 1024 * 1024),
         gc_interval: Some(100),
         max_recursion_depth: 50,
@@ -652,6 +652,8 @@ fn resource_limits_round_trip() {
         max_total_sleep: Some(Duration::from_secs(30)),
     };
     let back = ResourceLimits::from(pb::ResourceLimits::from(&limits));
+    assert_eq!(back.max_feed_steps, Some(123_456_789));
+    assert_eq!(back.max_turn_steps, Some(4_567));
     assert_eq!(back.max_feed_duration, limits.max_feed_duration);
     assert_eq!(back.max_turn_duration, limits.max_turn_duration);
     assert_eq!(back.max_total_sleep, limits.max_total_sleep);
@@ -801,6 +803,24 @@ fn empty_resource_limits_default_recursion_depth() {
     assert_eq!(back.max_recursion_depth, expected.max_recursion_depth);
     assert_eq!(back.max_suspensions, expected.max_suspensions);
     assert_eq!(back.max_suspensions, 1000);
+    // The step budgets are unlimited unless the client names them.
+    assert_eq!((back.max_feed_steps, back.max_turn_steps), (None, None));
+}
+
+/// The step budgets travel as their own wire fields: a limit set in one scope never shows up in the other, and
+/// a client that sets neither sends neither, so an older worker sees the message it always did.
+#[test]
+fn step_budgets_use_their_own_wire_fields() {
+    let feed_only = pb::ResourceLimits::from(&ResourceLimits::default().max_feed_steps(10));
+    assert_eq!((feed_only.max_feed_steps, feed_only.max_turn_steps), (Some(10), None));
+    let turn_only = pb::ResourceLimits::from(&ResourceLimits::default().max_turn_steps(20));
+    assert_eq!((turn_only.max_feed_steps, turn_only.max_turn_steps), (None, Some(20)));
+    let neither = pb::ResourceLimits::from(&ResourceLimits::default());
+    assert_eq!((neither.max_feed_steps, neither.max_turn_steps), (None, None));
+    // An unset optional field is not encoded at all, so a client that sets no step limit sends the bytes it
+    // always did; one that sets both adds two tag-and-varint pairs.
+    let both = pb::ResourceLimits::from(&ResourceLimits::default().max_feed_steps(10).max_turn_steps(20));
+    assert_eq!(both.encoded_len(), neither.encoded_len() + 4);
 }
 
 #[test]

@@ -688,6 +688,99 @@ fn turn_events_carry_the_suspension_budget() {
     assert_eq!(events[0].max_suspensions, Some(3));
 }
 
+/// A worker configured with `limits`, as a client names them in `Configure`.
+fn configured_worker(limits: &ResourceLimits) -> Worker {
+    let mut worker = Worker::default();
+    let request = frame_request(pb::client_request::Kind::Configure(pb::Configure {
+        script_name: "main.py".to_owned(),
+        limits: Some(limits.into()),
+        monty_version: MONTY_VERSION.to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        ..Default::default()
+    }));
+    let (bytes, outcome) = dispatch_frame(&mut worker, &request);
+    assert_eq!(outcome, HandleOutcome::Continue);
+    assert!(matches!(split_turn(&bytes).1, pb::worker_event::Kind::Ok(_)));
+    worker
+}
+
+/// The step budgets a client names in `Configure` reach the interpreter: a runaway feed ends with the
+/// uncatchable `TimeoutError` of that scope, and the next feed starts with a full budget.
+#[test]
+fn configured_step_budgets_stop_a_runaway_feed() {
+    for (scope, limits) in [
+        ("feed", ResourceLimits::default().max_feed_steps(50_000)),
+        ("turn", ResourceLimits::default().max_turn_steps(50_000)),
+    ] {
+        let mut worker = configured_worker(&limits);
+        // `try`/`finally` must not be able to swallow the stop.
+        let (_, event) = feed(
+            &mut worker,
+            "try:\n    while True:\n        pass\nexcept BaseException:\n    pass\nfinally:\n    pass",
+        );
+        let message = expect_error_message(event);
+        assert!(
+            message.starts_with(&format!("{scope} step limit exceeded: ")) && message.ends_with("> 50000 steps"),
+            "{scope}: {message}"
+        );
+        let (_, event) = feed(&mut worker, "1 + 1");
+        assert_eq!(
+            expect_complete(event),
+            MontyObject::int(2),
+            "{scope}: the budget restarts with each feed"
+        );
+    }
+}
+
+/// The point of a step budget: the same script stops at the same count in separate workers.
+#[test]
+fn a_step_budget_stops_every_worker_at_the_same_count() {
+    let limits = ResourceLimits::default().max_turn_steps(123_456);
+    let messages: Vec<String> = (0..3)
+        .map(|_| {
+            let mut worker = configured_worker(&limits);
+            expect_error_message(feed(&mut worker, "while True:\n    pass").1)
+        })
+        .collect();
+    assert!(messages[0].contains("> 123456 steps"), "{}", messages[0]);
+    assert_eq!(messages[0], messages[1]);
+    assert_eq!(messages[1], messages[2]);
+}
+
+/// A restored session keeps the step budget it was saved with, and the worker's own `Configure` can only
+/// tighten it.
+#[test]
+fn restore_keeps_and_tightens_step_budgets() {
+    for (saved, ceiling, effective) in [
+        (100_000, None, 100_000),
+        (100_000, Some(40_000), 40_000),
+        (40_000, Some(100_000), 40_000),
+    ] {
+        let repl = MontyRepl::new(
+            "saved.py",
+            ResourceTracker::new(ResourceLimits::default().max_turn_steps(saved)),
+            CompileOptions::default(),
+        );
+        let progress = repl.feed_start("x = 42", vec![], PrintWriter::Stdout).unwrap();
+        let ReplProgress::Complete { repl, .. } = &progress else {
+            panic!("expected the feed to complete");
+        };
+        let state = dump("saved.py", None, &[], SessionRef::Idle(repl)).unwrap();
+        let configured = ceiling.map_or_else(ResourceLimits::default, |ceiling| {
+            ResourceLimits::default().max_turn_steps(ceiling)
+        });
+        let mut worker = configured_worker(&configured);
+        let request = frame_request(pb::client_request::Kind::Load(pb::Load { state: state.into() }));
+        let (_, outcome) = dispatch_frame(&mut worker, &request);
+        assert_eq!(outcome, HandleOutcome::Continue);
+        let message = expect_error_message(feed(&mut worker, "while True:\n    pass").1);
+        assert!(
+            message.ends_with(&format!("> {effective} steps")),
+            "saved {saved}, ceiling {ceiling:?}: {message}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host modules: `import` and `import_stubs`
 // ---------------------------------------------------------------------------

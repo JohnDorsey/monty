@@ -21,6 +21,8 @@ pub fn extract_limits(dict: &Bound<'_, PyDict>) -> PyResult<monty_types::Resourc
         limits = match key {
             LimitKey::MaxFeedDurationSecs => limits.max_feed_duration(extract_duration(&value)?),
             LimitKey::MaxTurnDurationSecs => limits.max_turn_duration(extract_duration(&value)?),
+            LimitKey::MaxFeedSteps => limits.max_feed_steps(value.extract()?),
+            LimitKey::MaxTurnSteps => limits.max_turn_steps(value.extract()?),
             LimitKey::MaxMemory => limits.max_memory(value.extract()?),
             LimitKey::GcInterval => limits.gc_interval(value.extract()?),
             LimitKey::MaxRecursionDepth => limits.max_recursion_depth(value.extract()?),
@@ -47,6 +49,8 @@ fn extract_duration(value: &Bound<'_, PyAny>) -> PyResult<Duration> {
 enum LimitKey {
     MaxFeedDurationSecs,
     MaxTurnDurationSecs,
+    MaxFeedSteps,
+    MaxTurnSteps,
     MaxMemory,
     GcInterval,
     MaxRecursionDepth,
@@ -61,6 +65,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for LimitKey {
         match ob.extract::<&str>().unwrap_or_default() {
             "max_feed_duration_secs" => Ok(Self::MaxFeedDurationSecs),
             "max_turn_duration_secs" => Ok(Self::MaxTurnDurationSecs),
+            "max_feed_steps" => Ok(Self::MaxFeedSteps),
+            "max_turn_steps" => Ok(Self::MaxTurnSteps),
             "max_memory" => Ok(Self::MaxMemory),
             "gc_interval" => Ok(Self::GcInterval),
             "max_recursion_depth" => Ok(Self::MaxRecursionDepth),
@@ -74,8 +80,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for LimitKey {
                     .map_or_else(|_| "<unprintable key>".to_owned(), |r| r.to_string());
                 Err(PyValueError::new_err(format!(
                     "unknown limits key {key_repr}; accepted keys are \
-                     'max_feed_duration_secs', 'max_turn_duration_secs', 'max_memory', \
-                     'gc_interval', 'max_recursion_depth', 'max_suspensions', 'max_total_sleep_secs'"
+                     'max_feed_duration_secs', 'max_turn_duration_secs', 'max_feed_steps', \
+                     'max_turn_steps', 'max_memory', 'gc_interval', 'max_recursion_depth', \
+                     'max_suspensions', 'max_total_sleep_secs'"
                 )))
             }
         }
