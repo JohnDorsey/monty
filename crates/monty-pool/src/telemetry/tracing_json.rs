@@ -252,6 +252,10 @@ impl Serialize for JsonEncoded<'_> {
             MontyNode::Time(t) => s.serialize_str(&time_isoformat(t)),
             // total seconds, accumulated in f64 throughout: an extreme `days`
             // overflows the microseconds of the same sum in i64
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "host telemetry text: the product is an exact integer in f64, so every platform agrees"
+            )]
             MontyNode::TimeDelta(td) => s.serialize_f64(
                 f64::from(td.days).mul_add(86_400.0, f64::from(td.seconds)) + f64::from(td.microseconds) / 1e6,
             ),

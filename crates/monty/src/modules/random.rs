@@ -35,6 +35,7 @@ use crate::{
     intern::StaticStrings,
     modules::ModuleFunctions,
     os_dispatch::{PostConversionEffect, urandom_reply_error},
+    portable_math,
     types::{
         BuiltinType, List, LongInt, Module, PyTrait, Type,
         bytes::allocate_bytes,
@@ -862,7 +863,7 @@ fn sample_indices(target: RandomTarget, n: usize, k: i64, vm: &mut VM<'_>) -> Ru
     // `k` can be a `range` length near `i64::MAX`, so the arithmetic here must
     // not overflow before `check_allocation` refuses the request.
     let setsize: usize = if k > 5 {
-        let exponent = (k.saturating_mul(3) as f64).ln() / 4f64.ln();
+        let exponent = portable_math::ln(k.saturating_mul(3) as f64) / portable_math::ln(4.0);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1204,7 +1205,7 @@ fn normalvariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> RunR
 /// One standard normal deviate by `normalvariate`'s rejection loop.
 fn normal_deviate(rng: &mut Mt19937, tracker: &ResourceTracker) -> RunResult<f64> {
     // `NV_MAGICCONST = 4 * exp(-0.5) / sqrt(2.0)`, evaluated the same way.
-    let nv_magicconst = 4.0 * (-0.5f64).exp() / 2f64.sqrt();
+    let nv_magicconst = 4.0 * portable_math::exp(-0.5) / 2f64.sqrt();
     let mut attempts = 0usize;
     loop {
         tracker.check_time_every(attempts)?;
@@ -1213,7 +1214,7 @@ fn normal_deviate(rng: &mut Mt19937, tracker: &ResourceTracker) -> RunResult<f64
         let u2 = 1.0 - rng.random();
         let z = nv_magicconst * (u1 - 0.5) / u2;
         let zz = z * z / 4.0;
-        if zz <= -u2.ln() {
+        if zz <= -portable_math::ln(u2) {
             return Ok(z);
         }
     }
@@ -1242,9 +1243,9 @@ fn gauss(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Va
         } else {
             let rng = random.rng();
             let x2pi = rng.random() * TAU;
-            let g2rad = (-2.0 * (1.0 - rng.random()).ln()).sqrt();
-            random.set_gauss_next(Some(x2pi.sin() * g2rad));
-            x2pi.cos() * g2rad
+            let g2rad = (-2.0 * portable_math::ln(1.0 - rng.random())).sqrt();
+            random.set_gauss_next(Some(portable_math::sin(x2pi) * g2rad));
+            portable_math::cos(x2pi) * g2rad
         };
         mu + z * sigma
     })))
@@ -1266,7 +1267,7 @@ fn lognormvariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> Run
     let (mu, sigma) = (to_float(mu, vm)?, to_float(sigma, vm)?);
     let z = target.with_generator(vm, |random, vm| normal_deviate(random.rng(), &vm.heap.tracker))?;
     let exponent = mu + z * sigma;
-    let result = exponent.exp();
+    let result = portable_math::exp(exponent);
     if result.is_infinite() && exponent.is_finite() {
         Err(ExcType::overflow_math_range())
     } else {
@@ -1288,7 +1289,7 @@ fn expovariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> RunRes
     defer_drop!(lambd, vm);
     let lambd = to_float(lambd, vm)?;
     let r = target.with_generator(vm, |random, _| random.rng().random());
-    let numerator = -(1.0 - r).ln();
+    let numerator = -portable_math::ln(1.0 - r);
     Ok(Value::Float(float_div(numerator, lambd)?))
 }
 
@@ -1322,10 +1323,10 @@ fn vonmisesvariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> Ru
             vm.heap.tracker.check_time_every(attempts)?;
             attempts = attempts.wrapping_add(1);
             let u1 = rng.random();
-            let z = (PI * u1).cos();
+            let z = portable_math::cos(PI * u1);
             let d = z / (r + z);
             let u2 = rng.random();
-            if u2 < 1.0 - d * d || u2 <= (1.0 - d) * d.exp() {
+            if u2 < 1.0 - d * d || u2 <= (1.0 - d) * portable_math::exp(d) {
                 break z;
             }
         };
@@ -1333,9 +1334,9 @@ fn vonmisesvariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> Ru
         let f = (q + z) / (1.0 + q * z);
         let u3 = rng.random();
         let result = if u3 > 0.5 {
-            py_fmod(mu + f.acos(), TAU)
+            py_fmod(mu + portable_math::acos(f), TAU)
         } else {
-            py_fmod(mu - f.acos(), TAU)
+            py_fmod(mu - portable_math::acos(f), TAU)
         };
         Ok(Value::Float(result))
     })
@@ -1372,8 +1373,8 @@ fn gammavariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> RunRe
     reason = "`alpha == 1.0` is the exact branch condition in random.py"
 )]
 fn gamma_deviate(rng: &mut Mt19937, alpha: f64, beta: f64, tracker: &ResourceTracker) -> RunResult<f64> {
-    let log4 = 4f64.ln();
-    let sg_magicconst = 1.0 + 4.5f64.ln();
+    let log4 = portable_math::ln(4.0);
+    let sg_magicconst = 1.0 + portable_math::ln(4.5);
     let mut attempts = 0usize;
     if alpha > 1.0 {
         let ainv = (2.0 * alpha - 1.0).sqrt();
@@ -1387,16 +1388,16 @@ fn gamma_deviate(rng: &mut Mt19937, alpha: f64, beta: f64, tracker: &ResourceTra
                 continue;
             }
             let u2 = 1.0 - rng.random();
-            let v = (u1 / (1.0 - u1)).ln() / ainv;
-            let x = alpha * v.exp();
+            let v = portable_math::ln(u1 / (1.0 - u1)) / ainv;
+            let x = alpha * portable_math::exp(v);
             let z = u1 * u1 * u2;
             let r = bbb + ccc * v - x;
-            if r + sg_magicconst - 4.5 * z >= 0.0 || r >= z.ln() {
+            if r + sg_magicconst - 4.5 * z >= 0.0 || r >= portable_math::ln(z) {
                 return Ok(x * beta);
             }
         }
     } else if alpha == 1.0 {
-        Ok(-(1.0 - rng.random()).ln() * beta)
+        Ok(-portable_math::ln(1.0 - rng.random()) * beta)
     } else {
         loop {
             tracker.check_time_every(attempts)?;
@@ -1405,15 +1406,15 @@ fn gamma_deviate(rng: &mut Mt19937, alpha: f64, beta: f64, tracker: &ResourceTra
             let b = (E + alpha) / E;
             let p = b * u;
             let x = if p <= 1.0 {
-                p.powf(1.0 / alpha)
+                portable_math::powf(p, 1.0 / alpha)
             } else {
-                -((b - p) / alpha).ln()
+                -portable_math::ln((b - p) / alpha)
             };
             let u1 = rng.random();
             let accept = if p > 1.0 {
-                u1 <= x.powf(alpha - 1.0)
+                u1 <= portable_math::powf(x, alpha - 1.0)
             } else {
-                u1 <= (-x).exp()
+                u1 <= portable_math::exp(-x)
             };
             if accept {
                 return Ok(x * beta);
@@ -1487,7 +1488,9 @@ fn weibullvariate(target: RandomTarget, args: ArgValues, vm: &mut VM<'_>) -> Run
     defer_drop!(beta, vm);
     let (alpha, beta) = (to_float(alpha, vm)?, to_float(beta, vm)?);
     let u = 1.0 - target.with_generator(vm, |random, _| random.rng().random());
-    Ok(Value::Float(alpha * float_pow(-u.ln(), float_div(1.0, beta)?)?))
+    Ok(Value::Float(
+        alpha * float_pow(-portable_math::ln(u), float_div(1.0, beta)?)?,
+    ))
 }
 
 /// `binomialvariate(n=1, p=0.5)` — a Python `def`.
@@ -1550,7 +1553,7 @@ fn binomial_deviate(rng: &mut Mt19937, n: i64, p: f64, tracker: &ResourceTracker
         // BG: Devroye's geometric method, O(np).
         let mut x: i64 = 0;
         let mut y: i64 = 0;
-        let c = (1.0 - p).log2();
+        let c = portable_math::log2(1.0 - p);
         if c == 0.0 {
             return Ok(x);
         }
@@ -1562,7 +1565,9 @@ fn binomial_deviate(rng: &mut Mt19937, n: i64, p: f64, tracker: &ResourceTracker
                 // Retry zero draws before taking their logarithm.
                 continue;
             }
-            y = y.saturating_add((r.log2() / c).floor() as i64).saturating_add(1);
+            y = y
+                .saturating_add((portable_math::log2(r) / c).floor() as i64)
+                .saturating_add(1);
             if y > n {
                 return Ok(x);
             }
@@ -1601,13 +1606,13 @@ fn binomial_deviate(rng: &mut Mt19937, n: i64, p: f64, tracker: &ResourceTracker
         }
         let (alpha, lpq, m, h) = *setup.get_or_insert_with(|| {
             let alpha = (2.83 + 5.1 / b) * spq;
-            let lpq = (p / (1.0 - p)).ln();
+            let lpq = portable_math::ln(p / (1.0 - p));
             let m = ((n_f + 1.0) * p).floor();
             let h = libm::lgamma(m + 1.0) + libm::lgamma(n_f - m + 1.0);
             (alpha, lpq, m, h)
         });
         v *= alpha / (a / (us * us) + b);
-        if v.ln() <= h - libm::lgamma(k + 1.0) - libm::lgamma(n_f - k + 1.0) + (k - m) * lpq {
+        if portable_math::ln(v) <= h - libm::lgamma(k + 1.0) - libm::lgamma(n_f - k + 1.0) + (k - m) * lpq {
             return Ok(k_int);
         }
     }

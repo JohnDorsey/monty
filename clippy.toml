@@ -1,1 +1,31 @@
 absolute-paths-max-segments = 2
+
+# Float maths must not reach the platform's C library: results differ between glibc, the Windows UCRT and
+# Apple's libm in the last place. Use `crate::portable_math` (a pure Rust `libm`) instead.
+disallowed-methods = [
+    { path = "f64::sin", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::cos", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::tan", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::asin", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::acos", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::atan", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::atan2", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::sinh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::cosh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::tanh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::asinh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::acosh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::atanh", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::exp", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::exp2", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::exp_m1", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::ln", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::ln_1p", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::log", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::log2", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::log10", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::powf", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::cbrt", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::hypot", reason = "platform-dependent last digit; use crate::portable_math" },
+    { path = "f64::mul_add", reason = "platform-dependent last digit; use crate::portable_math" },
+]

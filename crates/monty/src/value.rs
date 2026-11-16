@@ -23,6 +23,7 @@ use crate::{
     identity::Identity,
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
+    portable_math,
     py_value::PyValue,
     types::{
         BytesIterator, CmpOrder, Complex, LazyHeapSet, Property, PyTrait, StringIterator, Type,
@@ -2321,7 +2322,7 @@ pub(crate) fn float_pow(base: f64, exp: f64) -> RunResult<f64> {
     if base == 0.0 && exp.is_finite() && exp < 0.0 {
         Err(ExcType::zero_negative_power())
     } else {
-        let result = base.powf(exp);
+        let result = portable_math::powf(base, exp);
         if result.is_infinite() && base.is_finite() && exp.is_finite() {
             Err(ExcType::overflow_float_pow())
         } else {

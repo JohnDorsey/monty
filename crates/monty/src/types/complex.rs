@@ -19,6 +19,7 @@ use crate::{
     hash::{HashValue, hash_f64},
     heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead},
     intern::StaticStrings,
+    portable_math,
     py_value::PyValue,
     types::{
         LazyHeapSet, PyTrait, Type,
@@ -91,7 +92,7 @@ impl Complex {
         } else if self.real.is_nan() || self.imag.is_nan() {
             Ok(f64::NAN)
         } else {
-            let result = self.real.hypot(self.imag);
+            let result = portable_math::hypot(self.real, self.imag);
             if result.is_infinite() {
                 Err(ExcType::overflow_error("absolute value too large"))
             } else {
@@ -281,15 +282,18 @@ impl Complex {
                 Some(Self::new(0.0, 0.0))
             }
         } else {
-            let vabs = self.real.hypot(self.imag);
-            let mut len = vabs.powf(exp.real);
-            let at = self.imag.atan2(self.real);
+            let vabs = portable_math::hypot(self.real, self.imag);
+            let mut len = portable_math::powf(vabs, exp.real);
+            let at = portable_math::atan2(self.imag, self.real);
             let mut phase = at * exp.real;
             if exp.imag != 0.0 {
-                len *= (-at * exp.imag).exp();
-                phase += exp.imag * vabs.ln();
+                len *= portable_math::exp(-at * exp.imag);
+                phase += exp.imag * portable_math::ln(vabs);
             }
-            Some(Self::new(len * phase.cos(), len * phase.sin()))
+            Some(Self::new(
+                len * portable_math::cos(phase),
+                len * portable_math::sin(phase),
+            ))
         }
     }
 }
