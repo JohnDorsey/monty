@@ -621,6 +621,8 @@ fn resource_limits_round_trip() {
     let limits = ResourceLimits {
         max_feed_duration: Some(Duration::from_millis(900)),
         max_turn_duration: Some(Duration::from_millis(250)),
+        max_feed_steps: None,
+        max_turn_steps: None,
         max_memory: Some(64 * 1024 * 1024),
         gc_interval: Some(100),
         max_recursion_depth: 50,

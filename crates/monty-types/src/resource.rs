@@ -94,6 +94,13 @@ pub enum ResourceError {
         limit: Duration,
         elapsed: Duration,
     },
+    /// One of the two step budgets was exceeded; `scope` says which. The scope type is shared with
+    /// the time budgets because the two pairs reset at the same moments.
+    Steps {
+        scope: TimeLimitScope,
+        limit: u64,
+        used: u64,
+    },
     /// Maximum memory usage exceeded.
     Memory { limit: usize, used: usize },
     /// Maximum recursion depth exceeded.
@@ -129,6 +136,9 @@ impl fmt::Display for ResourceError {
         match self {
             Self::Time { scope, limit, elapsed } => {
                 write!(f, "{}time limit exceeded: {elapsed:?} > {limit:?}", scope.prefix())
+            }
+            Self::Steps { scope, limit, used } => {
+                write!(f, "{}step limit exceeded: {used} steps > {limit} steps", scope.prefix())
             }
             Self::Memory { limit, used } => {
                 write!(f, "memory limit exceeded: {used} bytes > {limit} bytes")
@@ -181,6 +191,16 @@ pub struct ResourceLimits {
     /// each resume. Bounds the stretch of sandbox code between two host round
     /// trips. Use a separate host deadline to bound elapsed response time.
     pub max_turn_duration: Option<Duration>,
+    /// Maximum deterministic steps per feed, summed across turns. A step is one bytecode instruction, or
+    /// one item of native work (see [`ResourceTracker::check_time_every`]); the count depends only on the
+    /// program and its inputs, never on the speed of the machine, so a script stops at the same point
+    /// everywhere. Reset at each feed.
+    #[serde(default)]
+    pub max_feed_steps: Option<u64>,
+    /// Maximum deterministic steps for a single host turn, reset at each feed and each resume. See
+    /// [`max_feed_steps`](Self::max_feed_steps).
+    #[serde(default)]
+    pub max_turn_steps: Option<u64>,
     /// Maximum allocator-backed memory in bytes.
     ///
     /// Requires the executable to install and arm `monty-alloc`.
@@ -218,6 +238,8 @@ impl Default for ResourceLimits {
         Self {
             max_feed_duration: None,
             max_turn_duration: None,
+            max_feed_steps: None,
+            max_turn_steps: None,
             max_memory: None,
             gc_interval: None,
             max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
@@ -249,6 +271,20 @@ impl ResourceLimits {
     #[must_use]
     pub fn max_memory(mut self, limit: usize) -> Self {
         self.max_memory = Some(limit);
+        self
+    }
+
+    /// Sets the maximum number of deterministic steps for any single feed.
+    #[must_use]
+    pub fn max_feed_steps(mut self, limit: u64) -> Self {
+        self.max_feed_steps = Some(limit);
+        self
+    }
+
+    /// Sets the maximum number of deterministic steps for any single host turn.
+    #[must_use]
+    pub fn max_turn_steps(mut self, limit: u64) -> Self {
+        self.max_turn_steps = Some(limit);
         self
     }
 
@@ -315,6 +351,15 @@ pub struct ResourceTracker {
     /// loads it starts a fresh turn.
     #[serde(skip)]
     turn_execution_time: Cell<Duration>,
+    /// Deterministic steps taken over the whole session (telemetry; bounds nothing).
+    #[serde(default)]
+    total_steps: Cell<u64>,
+    /// Steps taken since the last [`on_feed_start`](Self::on_feed_start); serialized like the feed time.
+    #[serde(default)]
+    feed_steps: Cell<u64>,
+    /// Steps taken since the last [`on_turn_start`](Self::on_turn_start); not serialized, like the turn time.
+    #[serde(skip)]
+    turn_steps: Cell<u64>,
     /// When the current execution window started; `None` while suspended or
     /// idle. Never serialized — a snapshot is by definition taken while not
     /// executing.
@@ -346,6 +391,8 @@ impl ResourceTracker {
         self.limits.max_memory = tighter_limit(self.limits.max_memory, ceiling.max_memory);
         self.limits.max_feed_duration = tighter_limit(self.limits.max_feed_duration, ceiling.max_feed_duration);
         self.limits.max_turn_duration = tighter_limit(self.limits.max_turn_duration, ceiling.max_turn_duration);
+        self.limits.max_feed_steps = tighter_limit(self.limits.max_feed_steps, ceiling.max_feed_steps);
+        self.limits.max_turn_steps = tighter_limit(self.limits.max_turn_steps, ceiling.max_turn_steps);
         self.limits.max_total_sleep = tighter_limit(self.limits.max_total_sleep, ceiling.max_total_sleep);
         self.limits.gc_interval = tighter_gc_interval(self.limits.gc_interval, ceiling.gc_interval);
         self.limits.max_recursion_depth = self.limits.max_recursion_depth.min(ceiling.max_recursion_depth);
@@ -372,6 +419,9 @@ impl ResourceTracker {
             total_execution_time: Cell::new(Duration::ZERO),
             feed_execution_time: Cell::new(Duration::ZERO),
             turn_execution_time: Cell::new(Duration::ZERO),
+            total_steps: Cell::new(0),
+            feed_steps: Cell::new(0),
+            turn_steps: Cell::new(0),
             running_since: Cell::new(None),
             recursion_limit_override: Cell::new(None),
         }
@@ -454,6 +504,52 @@ impl ResourceTracker {
         self.limits.max_turn_duration
     }
 
+    /// Returns the configured per-feed step limit, if any.
+    #[must_use]
+    pub fn max_feed_steps(&self) -> Option<u64> {
+        self.limits.max_feed_steps
+    }
+
+    /// Returns the configured per-turn step limit, if any.
+    #[must_use]
+    pub fn max_turn_steps(&self) -> Option<u64> {
+        self.limits.max_turn_steps
+    }
+
+    /// Returns the deterministic steps taken over the whole session. Nothing is bounded by this.
+    #[must_use]
+    pub fn steps(&self) -> u64 {
+        self.total_steps.get()
+    }
+
+    /// Returns the deterministic steps taken by the current feed.
+    #[must_use]
+    pub fn feed_steps(&self) -> u64 {
+        self.feed_steps.get()
+    }
+
+    /// Returns the deterministic steps taken by the current host turn.
+    #[must_use]
+    pub fn turn_steps(&self) -> u64 {
+        self.turn_steps.get()
+    }
+
+    /// Records `count` steps of work. Only counts; the limits are tested by [`check_time`](Self::check_time),
+    /// so the dispatch loop can add steps cheaply and test them at its checkpoint.
+    #[inline]
+    pub fn add_steps(&self, count: u64) {
+        self.total_steps.set(self.total_steps.get().saturating_add(count));
+        self.feed_steps.set(self.feed_steps.get().saturating_add(count));
+        self.turn_steps.set(self.turn_steps.get().saturating_add(count));
+    }
+
+    /// Returns whether either step budget is configured.
+    #[must_use]
+    #[inline]
+    pub fn has_step_limit(&self) -> bool {
+        self.limits.max_feed_steps.is_some() || self.limits.max_turn_steps.is_some()
+    }
+
     /// Returns the configured memory budget, if any. Hosts that bound a worker
     /// process from outside the interpreter size that bound from this.
     #[must_use]
@@ -477,7 +573,7 @@ impl ResourceTracker {
     /// Returns whether the VM has a memory or time limit configured.
     #[must_use]
     pub fn has_memory_time_limit(&self) -> bool {
-        self.limits.max_memory.is_some() || self.has_time_limit()
+        self.limits.max_memory.is_some() || self.has_time_limit() || self.has_step_limit()
     }
 
     /// Returns whether either execution-time budget is configured.
@@ -551,6 +647,7 @@ impl ResourceTracker {
     /// first, since it is the one a new turn cannot recover from.
     #[inline]
     pub fn check_time(&self) -> Result<(), ResourceError> {
+        self.check_steps()?;
         if !self.has_time_limit() {
             return Ok(());
         }
@@ -570,6 +667,13 @@ impl ResourceTracker {
         })
     }
 
+    /// Tests both step budgets against the steps taken so far, feed first like the time budgets.
+    #[inline]
+    fn check_steps(&self) -> Result<(), ResourceError> {
+        check_step_budget(TimeLimitScope::Feed, self.limits.max_feed_steps, self.feed_steps.get())
+            .and_then(|()| check_step_budget(TimeLimitScope::Turn, self.limits.max_turn_steps, self.turn_steps.get()))
+    }
+
     /// Items processed between full checks in amortized per-item Rust loops
     /// (see [`check_time_every`](Self::check_time_every)). A limit can be
     /// overshot by up to this many items' work before the next check — an
@@ -586,6 +690,7 @@ impl ResourceTracker {
     #[inline]
     pub fn check_time_every(&self, i: usize) -> Result<(), ResourceError> {
         if i % Self::LOOP_CHECK_INTERVAL == Self::LOOP_CHECK_INTERVAL - 1 {
+            self.add_steps(Self::LOOP_CHECK_INTERVAL as u64);
             self.check_time()
         } else {
             Ok(())
@@ -599,6 +704,7 @@ impl ResourceTracker {
     #[inline]
     pub fn check_memory_time_every(&self, i: usize) -> Result<(), ResourceError> {
         if i % Self::LOOP_CHECK_INTERVAL == Self::LOOP_CHECK_INTERVAL - 1 {
+            self.add_steps(Self::LOOP_CHECK_INTERVAL as u64);
             self.check_memory_time()
         } else {
             Ok(())
@@ -752,6 +858,7 @@ impl ResourceTracker {
     /// the snippet's first turn — not at the resumes that continue it.
     pub fn on_feed_start(&self) {
         self.feed_execution_time.set(Duration::ZERO);
+        self.feed_steps.set(0);
         self.on_turn_start();
     }
 
@@ -762,6 +869,7 @@ impl ResourceTracker {
     /// future, a task switch) stay inside the turn that started them.
     pub fn on_turn_start(&self) {
         self.turn_execution_time.set(Duration::ZERO);
+        self.turn_steps.set(0);
     }
 
     /// Performs a standard-execution sleep without charging `max_feed_duration`.
@@ -817,6 +925,15 @@ fn tighter_gc_interval(existing: Option<usize>, ceiling: Option<usize>) -> Optio
 fn check_budget(scope: TimeLimitScope, limit: Option<Duration>, elapsed: Duration) -> Result<(), ResourceError> {
     match limit {
         Some(limit) if elapsed > limit => Err(ResourceError::Time { scope, limit, elapsed }),
+        _ => Ok(()),
+    }
+}
+
+/// Reports `used` steps against one optional budget, naming `scope` in the error.
+#[inline]
+fn check_step_budget(scope: TimeLimitScope, limit: Option<u64>, used: u64) -> Result<(), ResourceError> {
+    match limit {
+        Some(limit) if used > limit => Err(ResourceError::Steps { scope, limit, used }),
         _ => Ok(()),
     }
 }

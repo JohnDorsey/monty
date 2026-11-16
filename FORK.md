@@ -25,6 +25,29 @@ Branch `deterministic-math`, based on tag `v1.6.0`.
   `pow`, `**`, `atan2`, `hypot`, `fma` compared bit for bit with `libm` over 6,000 generated inputs each, plus a golden test of
   seeded `random` distributions and complex powers.
 
+## Second change: a deterministic step budget (phases 0 to 3 of the plan)
+
+A time limit cuts a script off at a different instruction on a slow machine than on a fast one. A **step budget** counts
+work instead, so the cut-off is the same everywhere. Plan and reasons: `docs/monty-step-budget-plan.md` in the Voxunami
+repository.
+
+- `ResourceLimits::max_feed_steps` and `max_turn_steps` (builders of the same names). Exceeding one raises an uncatchable
+  `TimeoutError` ("turn step limit exceeded: N steps > M steps"), like the time limits. Time limits stay.
+- A step is one bytecode instruction, plus 64 for every 64 items a native loop works through (`check_time_every`). The run
+  loop charges its instructions at each checkpoint and again when it returns, so a short callback called from native code
+  (a sort key, a `map` function, `__eq__` in a list search) is counted too; without that charge a quarter to a third of
+  such work went uncounted (measured).
+- `ResourceTracker::steps()`, `feed_steps()`, `turn_steps()` read the counts; they count even when no limit is set. The
+  feed and session counts are saved in a dump; the turn count starts again, like the turn time. A dump written before this
+  change still loads (the fields have defaults).
+- The count depends on the bytecode compiler: a Monty release that compiles differently changes every script's count. The
+  three pinned counts in `crates/monty/tests/step_budget.rs` (`GOLDEN_STEPS`) show it at once.
+- **Not done yet:** the limits are not carried over the worker pool's wire format (`monty-proto`), so a worker behind
+  `monty-pool` runs without a step budget until phase 5; and the audit of single native operations that do a lot of work
+  in one call (huge powers, sorting, regular expressions) is phase 4.
+- Cost, measured on Windows with a release build: tight loops (`fib(27)`, a 5M-iteration loop) within 1 percent of
+  unpatched; a callback-heavy sort (300,000 key calls) about 6 percent slower, the price of charging every nested call.
+
 ## What is deliberately not changed
 
 - `sqrt`, `floor`, `ceil`, `trunc`, `abs`, `copysign`, `%` are exact by definition.
