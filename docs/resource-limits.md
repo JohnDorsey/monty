@@ -106,8 +106,9 @@ an integer 8 per 64-bit word, a global or stack slot 16, and a call frame 128.
 The full table is in `FORK.md`.
 
 The prices are a convention that approximates a 64-bit build, not a measurement: measured, the count ran between 0.75 and
-0.97 of what the allocator saw, mostly because it ignores the spare room in lists grown one push at a time. It ignores
-interned strings and compiled code, and what a call holds only while it runs.
+0.97 of what the allocator saw, mostly because it ignores the spare room in lists grown one push at a time. It counts the
+source that `eval` and `exec` compile, because every call keeps its own; it ignores the code the host feeds and what a
+call holds only while it runs.
 It is measured at the interpreter's checkpoints, and a script that allocates fast can pass the limit by a few percent
 before it is stopped, more for a heap of hundreds of thousands of objects.
 Exceeding it raises the same uncatchable `MemoryError`, with the message `model memory limit exceeded: N bytes > M bytes`,

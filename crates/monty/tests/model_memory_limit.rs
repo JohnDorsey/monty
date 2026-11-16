@@ -22,7 +22,7 @@ const SAFETY_NET: Duration = Duration::from_secs(30);
 const LIMIT: usize = 1_000_000;
 
 /// Scripts that never stop on their own: each grows the session one way until the limit ends it.
-const RUNAWAYS: [(&str, &str); 5] = [
+const RUNAWAYS: [(&str, &str); 6] = [
     ("small lists", "x = []\nwhile True:\n    x.append([0])\n"),
     (
         // Long enough that each is an object of its own: short strings live inside the value that holds them.
@@ -34,6 +34,11 @@ const RUNAWAYS: [(&str, &str); 5] = [
     (
         "big integers",
         "x = []\nn = 3 ** 1000\nwhile True:\n    x.append(n + len(x))\n",
+    ),
+    (
+        // Nothing is on the heap here: what grows is the source and code every `exec` keeps for the session.
+        "exec",
+        "while True:\n    exec('x = 1')\n",
     ),
 ];
 
@@ -148,13 +153,15 @@ fn a_runaway_stops_at_the_same_step_every_time() {
 /// step charges or the walk schedule do. A change that moves them is a change of the model, not a flake.
 #[test]
 fn runaways_stop_at_pinned_steps() {
-    let pinned: [(&str, u64, usize); 5] = [
+    let pinned: [(&str, u64, usize); 6] = [
         ("small lists", 69_672, 1_007_872),
         ("strings", 97_283, 1_012_262),
         ("dict of ints", 152_832, 1_000_584),
         ("one growing list", 437_504, 1_000_256),
         ("big integers", 36_526, 1_046_688),
+        ("exec", 14_336, 1_004_088),
     ];
+    assert_eq!(pinned.len(), RUNAWAYS.len());
     for ((name, code), (pinned_name, steps, used)) in RUNAWAYS.iter().zip(pinned) {
         assert_eq!(*name, pinned_name);
         let (got_steps, error) = trip(code, LIMIT);

@@ -144,6 +144,7 @@ pinned by `tests/model_memory_costs.rs`):
 | `random.Random`                | 2,560                                                                         |
 | buffering `itertools` adaptor  | 16 per value it holds (`cycle`, `tee`, `product`, `combinations`, `permutations`) |
 | globals and stack              | 16 per slot; 128 per call frame                                               |
+| source compiled by `eval`/`exec` | 640 per call plus 12 per byte of source, kept for the session; none if it does not compile |
 
 Small ints, floats, bools, `None` and strings short enough to live inside a value cost nothing beyond their slot. An
 object that two names point to is priced once. Garbage that nothing points to stops counting when it is freed; an
@@ -186,9 +187,11 @@ the same point on every machine.
   size for what it was not (read from the constants, not measured as a bound).
 - **Spiking inside one instruction is not seen.** The count is taken between instructions, so a call that holds a large
   temporary while it runs is only seen if the temporary is still there afterwards.
-- **Not counted:** the interned strings and compiled bytecode of the program (so `eval` and `exec` of generated source
-  keep growing the session unseen, bounded by the step budget), the host's print buffers, the operand stack's spare
-  capacity, and the contents of `csv`, `os.scandir` and open-file objects, which are priced as fixed objects (96 bytes,
+- **Source compiled by `eval` and `exec` is counted**, because each call keeps its source and code for the life of the
+  session and shares nothing with the last (2,000 `exec('x = 1')` kept 1.29 MB, measured, while the model saw 16 bytes).
+  Measured against the allocator the price is 0.95 to 1.08 of real growth (2,000 `exec`s of one tiny source, of distinct
+  tiny sources, of 200-byte sources, and of `eval`). The code the host feeds is the host's to bound and is not counted.
+- **Not counted:** the host's print buffers, the operand stack's spare capacity, imported module files, and the contents of `csv`, `os.scandir` and open-file objects, which are priced as fixed objects (96 bytes,
   or 208 when the payload is boxed).
 - **Capacity must never reach the schedule.** The growth pre-checks that come from buffer capacities (`check_growth`,
   `check_pending_allocation`) are deliberately kept out of the model: a restored list has capacity equal to its length,
@@ -218,10 +221,10 @@ worker processes behind `monty-pool`, and the Python and JavaScript limits tests
 
 ## Verification status (2026-11-16)
 
-- Windows, after the memory limit: `monty`, `monty-types` and `monty-runtime` 1,495 tests, `monty-proto` (with the
+- Windows, after the memory limit: `monty`, `monty-types` and `monty-runtime` 1,497 tests, `monty-proto` (with the
   `worker` feature) 156, `monty-pool` 195, none failing, including the golden step counts. Clippy (denying warnings) and
   nightly rustfmt are clean for those crates.
-- Linux (WSL), the same: `monty`, `monty-types`, `monty-runtime` 1,524 passed and 3 failed, `monty-proto` 156, `monty-pool`
+- Linux (WSL), the same: `monty`, `monty-types`, `monty-runtime` 1,526 passed and 3 failed, `monty-proto` 156, `monty-pool`
   248. The three failures are the compile-fail snapshot tests `readonly_mutable_projection`, `smuggle_and_swap_reader` and
   `smuggle_heap_read` in `heap_reader_compile_fail` (Linux only, and not run under `memory-model-checks`, which is how the
   earlier Linux runs were configured): they fail identically on an untouched copy of upstream `main` with Rust 1.99, which

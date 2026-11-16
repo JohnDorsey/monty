@@ -1222,10 +1222,11 @@ impl<'h> VM<'h> {
     }
 
     /// What the VM itself holds that the deterministic memory model counts, beside the heap: the operand
-    /// stack, the globals, and the call frames.
+    /// stack, the globals, the call frames, and the source compiled at run time.
     fn model_bytes(&self) -> usize {
         (self.stack.len() + self.globals.len()) * model::VALUE_BYTES
             + (self.suspended_frames.len() + 1) * model::FRAME_BYTES
+            + self.interns.model_bytes()
     }
 
     /// Walks the session and tests the deterministic memory limit, when a walk is due (see

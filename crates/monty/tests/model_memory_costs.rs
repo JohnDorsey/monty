@@ -17,6 +17,11 @@ const DICT_ENTRY: usize = 72;
 const SET_ENTRY: usize = 40;
 /// The separate allocation behind a boxed payload (an instance, a named tuple, a partial, a match).
 const BOXED: usize = 112;
+/// What each `eval` or `exec` call adds to the session whatever it compiles: the retained source, the code
+/// object and its tables.
+const COMPILE_BASE: usize = 640;
+/// What each byte of the compiled source adds on top.
+const COMPILE_BYTE: usize = 12;
 /// One 64-bit limb of an integer too large for an `i64`.
 const LIMB: usize = 8;
 
@@ -164,6 +169,38 @@ fn buffering_adaptors_and_caches_cost_what_they_have_buffered() {
 }
 
 #[test]
+fn source_compiled_by_eval_and_exec_is_kept_for_the_session_and_costs_by_its_length() {
+    let mut repl = new_repl();
+    // The first call may set up tables of its own; every call after it costs the same.
+    feed(&mut repl, "x = 0\nexec('x = 1')");
+    let before = repl.model_bytes();
+    feed(&mut repl, "exec('x = 1')");
+    assert_eq!(repl.model_bytes() - before, COMPILE_BASE + 5 * COMPILE_BYTE);
+    // The same text again is another snippet: nothing is shared between calls.
+    feed(&mut repl, "exec('x = 1')\neval('x + 1')");
+    assert_eq!(
+        repl.model_bytes() - before,
+        3 * COMPILE_BASE + (5 + 5 + 5) * COMPILE_BYTE
+    );
+    // A longer source costs more, by the byte. (The list it builds is an object too.)
+    let at_three = repl.model_bytes();
+    feed(&mut repl, "exec('x = [1' + ', 1' * 99 + ']')");
+    assert_eq!(
+        repl.model_bytes() - at_three,
+        COMPILE_BASE + 304 * COMPILE_BYTE + OBJECT + 100 * VALUE
+    );
+}
+
+#[test]
+fn source_that_does_not_compile_is_not_kept() {
+    let mut repl = new_repl();
+    feed(&mut repl, "x = 0\nexec('x = 1')");
+    let before = repl.model_bytes();
+    feed(&mut repl, "try:\n    eval('1 +')\nexcept SyntaxError:\n    pass");
+    assert_eq!(repl.model_bytes(), before);
+}
+
+#[test]
 fn a_random_generator_costs_its_state() {
     assert_eq!(cost_of("import random", "random.Random(1)"), OBJECT + 2560);
 }
@@ -219,7 +256,7 @@ fn the_count_is_the_same_after_a_dump_and_restore() {
     let mut repl = new_repl();
     feed(
         &mut repl,
-        "x = [str(i) * 3 for i in range(50)]\nd = {i: [i] for i in range(20)}\nbig = 3 ** 500",
+        "x = [str(i) * 3 for i in range(50)]\nd = {i: [i] for i in range(20)}\nbig = 3 ** 500\nexec('y = 1')\neval('y')",
     );
     let before = repl.model_bytes();
     let bytes = dump("model.py", None, &[], SessionRef::Idle(&repl)).unwrap();

@@ -9,7 +9,7 @@ use super::{
     BytesId, FILE_SOURCE_ID_BASE, FileSource, InternedString, Interns, LongIntId, SOURCE_ID_BASE, StaticStrings,
     StringId, next_string_id,
 };
-use crate::{function::Function, hash::WithHash};
+use crate::{function::Function, hash::WithHash, heap::model};
 
 /// Compilation tables with final IDs assigned before execution.
 /// Existing sessions use a private overlay so rejection retains no products.
@@ -50,8 +50,10 @@ impl<'i> CompileInterns<'i> {
         Self { base, pending: None }
     }
 
-    /// Publishes an overlay in provisional-ID order; direct compilation is already published.
-    pub(crate) fn commit(mut self) {
+    /// Publishes an overlay in provisional-ID order; direct compilation is already published. Returns what the
+    /// published snippet sources cost by the memory model, for telling the tracker.
+    pub(crate) fn commit(mut self) -> usize {
+        let mut model_bytes = 0;
         if let Some(pending) = &mut self.pending {
             for entry in pending.strings.drain(..) {
                 self.base.strings.push(entry);
@@ -74,12 +76,15 @@ impl<'i> CompileInterns<'i> {
                 self.base.functions.push(Box::new(entry));
             }
             for source in pending.sources.drain(..) {
+                self.base.note_eval_source(source.len());
+                model_bytes += model::COMPILED_SNIPPET_BYTES + source.len() * model::COMPILED_SOURCE_BYTE_BYTES;
                 self.base.eval_sources.push(source);
             }
             for file in pending.file_sources.drain(..) {
                 self.base.file_sources.push(file);
             }
         }
+        model_bytes
     }
 
     /// Deduplicates against pending and committed text before assigning an ID.
@@ -206,6 +211,7 @@ impl<'i> CompileInterns<'i> {
         if let Some(pending) = &mut self.pending {
             pending.sources.push(source);
         } else {
+            self.base.note_eval_source(source.len());
             self.base.eval_sources.push(source);
         }
         id

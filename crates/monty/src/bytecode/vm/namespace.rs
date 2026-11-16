@@ -270,7 +270,12 @@ impl<'h> VM<'h> {
         // Publication makes the code borrowable for the run. Nothing fallible or
         // re-entrant may intervene between admission and installing the frame.
         if let Some(overlay) = overlay {
-            overlay.commit();
+            let model_bytes = overlay.commit();
+            // Source compiled by `eval` and `exec` stays for the session: tell the memory limit, so that a loop
+            // of them is measured as it grows.
+            if vm.heap.tracker.has_model_limit() {
+                vm.heap.tracker.note_model_growth(model_bytes);
+            }
         }
         let (namespace, vm) = namespace_guard.into_parts();
         let code = &vm.interns.get_function(func_id).code;

@@ -58,6 +58,15 @@ pub(crate) const PATTERN_CHARACTER_BYTES: usize = 64;
 /// A `hashlib` object's running state and block buffer.
 pub(crate) const HASH_STATE_BYTES: usize = 256;
 
+/// What each `eval` or `exec` call that compiles adds to the session whatever the source says: the retained
+/// source text's record, the code object and the tables behind it. Nothing is shared between calls, so a loop of
+/// `exec` grows the session without bound.
+pub(crate) const COMPILED_SNIPPET_BYTES: usize = 640;
+
+/// What each byte of source compiled by `eval` or `exec` adds: the text itself and the bytecode, constants and
+/// names compiled from it.
+pub(crate) const COMPILED_SOURCE_BYTE_BYTES: usize = 12;
+
 /// One call frame of the interpreter, besides the values it keeps on the operand stack.
 pub(crate) const FRAME_BYTES: usize = 128;
 
