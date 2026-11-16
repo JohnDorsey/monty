@@ -103,11 +103,24 @@ per item and are not charged twice.
   (`monty-pool/tests/pool_test.rs`). The Python and JavaScript tests were written but not run (they need the extension
   and node builds).
 
+## Verification status (2026-11-16)
+
+- Windows: full suites of `monty`, `monty-types`, `monty-proto`, `monty-runtime`, `monty-pool`; clippy and rustfmt clean
+  for the crates changed. Linux (WSL): the same suites, 89 test binaries, no failures, including the golden step counts.
+- Python (`test_limits.py`) and JavaScript (`limits.spec.ts`) tests for the new limits are written but have not been run:
+  they need the `maturin` and `npm` builds.
+- Known failures that are not ours, each reproduced on a pristine copy: `monty-proto`'s `dispatch` test binary aborts with
+  "`Value::Ref` dropped without calling `drop_with()`" in `async_calls_suspend_without_accepting_streamed_calls` when
+  `monty` is built with `memory-model-checks` (upstream `main`, Windows and Linux; run that binary without the feature).
+  `monty-fs` fails clippy `unnecessary_wraps` on Windows and `monty-pool`'s tests have Windows-only unused imports.
+- A test that builds its own big numbers must stay small: test builds are unoptimized, and an early modular-power case ran
+  past a 20 second safety net on Linux.
+
 ## Tracking upstream
 
 The branch was cut from the `v1.6.0` tag. Upstream `main` had moved 36 commits by 2026-11-16 with no newer release tag.
-`catch-up-upstream-main` merges it (three small conflicts) and the golden step counts did not move, so the compiler is
-unchanged. One thing the merge changed: upstream's new shared table copy (`hash_table.rs`, `copy_table`) polls the
+`deterministic-math` now follows upstream `main` (owner's decision 2026-11-16): it merged it (three small conflicts) and the
+golden step counts did not move, so the compiler is unchanged. One thing the merge changed: upstream's new shared table copy (`hash_table.rs`, `copy_table`) polls the
 tracker once per entry, so the method-level charges for dict and set copies and set algebra were dropped there to avoid
 counting them twice; on the `v1.6.0` line they are still needed. Count drift is the risk of following upstream: watch
 `GOLDEN_STEPS` in `tests/step_budget.rs` at every merge.

@@ -69,9 +69,11 @@ fn modular_power_charges_per_exponent_bit() {
     // Below the polling threshold: 3**3000 + 1 has 4,755 bits (75 limbs), the exponent 4,755 bits.
     let small = "m = 3 ** 3000 + 1\ne = 3 ** 3000";
     assert_about(small, "x = pow(7, e, m)", 4_755 * 75 * 75 / 128);
-    // Above it: modulus 3**20000 + 1, 31,700 bits (496 limbs); exponent 3**2000, 3,170 bits.
-    let large = "m = 3 ** 20000 + 1\ne = 3 ** 2000";
-    assert_about(large, "x = pow(7, e, m)", 3_170 * 496 * 496 / 128);
+    // Above it (exponent bits times words squared over 2**27, which takes the per-bit polled path): modulus
+    // 3**5000 + 1 has 7,925 bits (124 limbs), the exponent 3**6000 has 9,510 bits. Kept small because the
+    // test builds are unoptimized and the first version of this case took over 20 seconds on Linux.
+    let large = "m = 3 ** 5000 + 1\ne = 3 ** 6000";
+    assert_about(large, "x = pow(7, e, m)", 9_510 * 124 * 124 / 128);
 }
 
 #[test]
