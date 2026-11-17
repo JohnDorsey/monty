@@ -51,7 +51,7 @@ impl<'i> CompileInterns<'i> {
     }
 
     /// Publishes an overlay in provisional-ID order; direct compilation is already published. Returns what the
-    /// published snippet sources cost by the memory model, for telling the tracker.
+    /// published `eval`/`exec` and file sources cost by the memory model, for telling the tracker.
     pub(crate) fn commit(mut self) -> usize {
         let mut model_bytes = 0;
         if let Some(pending) = &mut self.pending {
@@ -76,11 +76,13 @@ impl<'i> CompileInterns<'i> {
                 self.base.functions.push(Box::new(entry));
             }
             for source in pending.sources.drain(..) {
-                self.base.note_eval_source(source.len());
+                self.base.note_compiled_source(source.len());
                 model_bytes += model::COMPILED_SNIPPET_BYTES + source.len() * model::COMPILED_SOURCE_BYTE_BYTES;
                 self.base.eval_sources.push(source);
             }
             for file in pending.file_sources.drain(..) {
+                self.base.note_compiled_source(file.source.len());
+                model_bytes += model::COMPILED_SNIPPET_BYTES + file.source.len() * model::COMPILED_SOURCE_BYTE_BYTES;
                 self.base.file_sources.push(file);
             }
         }
@@ -211,7 +213,7 @@ impl<'i> CompileInterns<'i> {
         if let Some(pending) = &mut self.pending {
             pending.sources.push(source);
         } else {
-            self.base.note_eval_source(source.len());
+            self.base.note_compiled_source(source.len());
             self.base.eval_sources.push(source);
         }
         id
@@ -226,6 +228,7 @@ impl<'i> CompileInterns<'i> {
         if let Some(pending) = &mut self.pending {
             pending.file_sources.push(file);
         } else {
+            self.base.note_compiled_source(file.source.len());
             self.base.file_sources.push(file);
         }
         id

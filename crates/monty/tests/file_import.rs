@@ -499,3 +499,135 @@ fn suspended_helpers() -> ReplOsCall {
     assert_eq!(read.function_call.name(), "Path.read_text");
     read
 }
+
+// ---- the deterministic memory model: an imported file's source is kept for the session ----
+
+/// What each compiled snippet adds whatever it says, and what each byte of its source adds (see `FORK.md`).
+const COMPILED_SNIPPET_BYTES: usize = 640;
+const COMPILED_SOURCE_BYTE_BYTES: usize = 12;
+
+/// A module whose body compiles and then raises, so the session keeps its source but no module.
+const FAILING_BODY: &str = "raise ValueError('x')\n";
+
+/// `import name`, caught when its body raises, in a session that has done it once already (the first call may
+/// set up tables of its own). Returns the session and what one more import adds.
+fn model_bytes_of_one_more_failing_import(source: &str) -> usize {
+    let files = [("/proj/bad.py", source)];
+    let attempt = "try:\n    import bad\nexcept (ValueError, SyntaxError):\n    pass";
+    let (repl, result) = feed(repl(), attempt, &files);
+    result.unwrap();
+    let before = repl.model_bytes();
+    let (repl, result) = feed(repl, attempt, &files);
+    result.unwrap();
+    repl.model_bytes() - before
+}
+
+#[test]
+fn an_imported_file_is_kept_for_the_session_and_costs_by_its_length() {
+    // The module is forgotten when its body fails, so the import retries the file; each try keeps the source.
+    assert_eq!(
+        model_bytes_of_one_more_failing_import(FAILING_BODY),
+        COMPILED_SNIPPET_BYTES + FAILING_BODY.len() * COMPILED_SOURCE_BYTE_BYTES
+    );
+    let padded = format!("{FAILING_BODY}{}\n", "#".repeat(1000));
+    assert_eq!(
+        model_bytes_of_one_more_failing_import(&padded),
+        COMPILED_SNIPPET_BYTES + padded.len() * COMPILED_SOURCE_BYTE_BYTES
+    );
+}
+
+#[test]
+fn a_file_that_does_not_compile_is_not_kept() {
+    assert_eq!(model_bytes_of_one_more_failing_import("def (:\n"), 0);
+}
+
+#[test]
+fn a_file_that_loads_costs_its_length_beside_the_module_it_makes() {
+    // Two modules of the same shape, one with a thousand more bytes of comment: the module's own objects cost the
+    // same, so the whole difference is the source.
+    let session_after = |name: &str, source: &str| {
+        let path = format!("/proj/{name}.py");
+        let (repl, result) = feed(repl(), &format!("import {name}"), &[(path.as_str(), source)]);
+        result.unwrap();
+        repl.model_bytes()
+    };
+    let short = "x = 1\n";
+    let long = format!("{short}{}\n", "#".repeat(1000));
+    assert_eq!(
+        session_after("mb", &long) - session_after("ma", short),
+        (long.len() - short.len()) * COMPILED_SOURCE_BYTE_BYTES
+    );
+}
+
+#[test]
+fn the_cost_of_imported_files_is_the_same_after_a_dump_and_restore() {
+    let files = [
+        ("/proj/helpers.py", "before = 1\nafter = [before] * 50\n"),
+        ("/proj/bad.py", FAILING_BODY),
+    ];
+    let (repl, result) = feed(
+        repl(),
+        "import helpers\nfor i in range(3):\n    try:\n        import bad\n    except ValueError:\n        pass",
+        &files,
+    );
+    result.unwrap();
+    let before = repl.model_bytes();
+    let bytes = dump("main.py", None, &[], SessionRef::Idle(&repl)).unwrap();
+    let Session::Idle(restored) = Dump::load(&bytes).unwrap().state else {
+        panic!("dumped while idle");
+    };
+    assert_eq!(restored.model_bytes(), before);
+}
+
+/// A loop of imports that each keep a source is stopped by `max_model_memory`, near the limit and never before it.
+#[test]
+fn a_loop_of_failing_imports_hits_the_model_memory_limit() {
+    let limit = 200_000;
+    let limits = ResourceLimits::default().max_model_memory(limit);
+    let mut repl = MontyRepl::new("main.py", ResourceTracker::new(limits), CompileOptions::default());
+    repl.set_cwd("/proj");
+    let mut imports = Vec::new();
+    let (repl, result) = feed_logged(
+        repl,
+        "for i in range(100000):\n    try:\n        import bad\n    except (ValueError, SyntaxError):\n        pass",
+        &[("/proj/bad.py", FAILING_BODY)],
+        &mut imports,
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("MemoryError: model memory limit exceeded: "),
+        "{error}"
+    );
+    let price = COMPILED_SNIPPET_BYTES + FAILING_BODY.len() * COMPILED_SOURCE_BYTE_BYTES;
+    // Never stopped early: the imports made were enough to reach the limit.
+    assert!(
+        imports.len() * price >= limit - 2_000,
+        "stopped early after {}",
+        imports.len()
+    );
+    // And not far late: the schedule's overshoot is a tenth of the limit at most.
+    assert!(repl.model_bytes() <= limit + limit / 10, "{}", repl.model_bytes());
+}
+
+/// One file that alone is over the limit stops the script when it is imported, not some thousands of steps later:
+/// the tracker is told what the import kept, so it measures at once.
+#[test]
+fn one_large_file_stops_the_script_at_the_import() {
+    let limit = 300_000;
+    let limits = ResourceLimits::default().max_model_memory(limit);
+    let mut repl = MontyRepl::new("main.py", ResourceTracker::new(limits), CompileOptions::default());
+    repl.set_cwd("/proj");
+    // Forty thousand bytes of comment cost 480,000 with the base: more than the whole limit.
+    let large = format!("{}\n{FAILING_BODY}", "#".repeat(40_000));
+    let (repl, result) = feed(
+        repl,
+        "try:\n    import bad\nexcept ValueError:\n    pass\nx = 0\ny = 0\nz = 0",
+        &[("/proj/bad.py", &large)],
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("MemoryError: model memory limit exceeded: "),
+        "{error}"
+    );
+    assert!(repl.model_bytes() > limit, "{}", repl.model_bytes());
+}

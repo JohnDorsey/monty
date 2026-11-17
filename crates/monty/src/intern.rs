@@ -2974,9 +2974,9 @@ pub(crate) struct Interns {
     /// Committed `typing.get_type_hints()` snippets by mode and annotation text.
     #[serde(skip)]
     hint_snippets: RefCell<AHashMap<(SnippetNames, Arc<str>), FunctionId>>,
-    /// The bytes of source text in `eval_sources`, for the memory model; rebuilt on load.
+    /// The bytes of source text in `eval_sources` and `file_sources`, for the memory model; rebuilt on load.
     #[serde(skip)]
-    eval_source_bytes: Cell<usize>,
+    compiled_source_bytes: Cell<usize>,
 }
 
 impl Default for Interns {
@@ -3018,7 +3018,12 @@ impl TryFrom<InternsWire> for Interns {
                 string_id_by_name.insert(text.to_owned(), id);
             }
         }
-        let eval_source_bytes = wire.eval_sources.iter().map(|source| source.len()).sum();
+        let compiled_source_bytes = wire
+            .eval_sources
+            .iter()
+            .map(|source| source.len())
+            .chain(wire.file_sources.iter().map(|file| file.source.len()))
+            .sum();
         Ok(Self {
             strings: wire.strings,
             bytes: wire.bytes,
@@ -3031,7 +3036,7 @@ impl TryFrom<InternsWire> for Interns {
             static_string_ids: RefCell::new(static_string_ids),
             compiling: Cell::new(false),
             hint_snippets: RefCell::default(),
-            eval_source_bytes: Cell::new(eval_source_bytes),
+            compiled_source_bytes: Cell::new(compiled_source_bytes),
         })
     }
 }
@@ -3070,7 +3075,7 @@ impl Interns {
             static_string_ids: RefCell::default(),
             compiling: Cell::new(false),
             hint_snippets: RefCell::default(),
-            eval_source_bytes: Cell::new(0),
+            compiled_source_bytes: Cell::new(0),
         }
     }
 
@@ -3089,7 +3094,7 @@ impl Interns {
             static_string_ids: RefCell::new(AHashMap::with_capacity(CORE_STATIC_STRINGS.len())),
             compiling: Cell::new(false),
             hint_snippets: RefCell::default(),
-            eval_source_bytes: Cell::new(0),
+            compiled_source_bytes: Cell::new(0),
         };
         for entry in CORE_ENTRIES.iter() {
             let value = entry.static_value().expect("core entries are static");
@@ -3178,17 +3183,19 @@ impl Interns {
             .map(AsRef::as_ref)
     }
 
-    /// What the source compiled at run time by `eval` and `exec` costs the session by the memory model. Each
-    /// call keeps its own source and code for the life of the session, so a script can grow this without
-    /// bound; the code the host fed is the host's to bound and is not counted.
+    /// What the source compiled at run time costs the session by the memory model: `eval` and `exec` strings,
+    /// and the files the host serves to an `import`. Each keeps its own source and code for the life of the
+    /// session, and a file whose body raises is read and compiled again by the next import, so a script can
+    /// grow this without bound; the code the host fed to the session directly is the host's to bound and is
+    /// not counted.
     pub(crate) fn model_bytes(&self) -> usize {
-        self.eval_sources.len() * model::COMPILED_SNIPPET_BYTES
-            + self.eval_source_bytes.get() * model::COMPILED_SOURCE_BYTE_BYTES
+        (self.eval_sources.len() + self.file_sources.len()) * model::COMPILED_SNIPPET_BYTES
+            + self.compiled_source_bytes.get() * model::COMPILED_SOURCE_BYTE_BYTES
     }
 
-    /// Records that a snippet source of `len` bytes was published.
-    fn note_eval_source(&self, len: usize) {
-        self.eval_source_bytes.set(self.eval_source_bytes.get() + len);
+    /// Records that a snippet or file source of `len` bytes was published.
+    fn note_compiled_source(&self, len: usize) {
+        self.compiled_source_bytes.set(self.compiled_source_bytes.get() + len);
     }
 
     /// Every snippet source with its filename-only ID, for a dump upgrade that rewrites positions.

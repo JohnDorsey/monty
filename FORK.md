@@ -144,7 +144,7 @@ pinned by `tests/model_memory_costs.rs`):
 | `random.Random`                | 2,560                                                                         |
 | buffering `itertools` adaptor  | 16 per value it holds (`cycle`, `tee`, `product`, `combinations`, `permutations`) |
 | globals and stack              | 16 per slot; 128 per call frame                                               |
-| source compiled by `eval`/`exec` | 640 per call plus 12 per byte of source, kept for the session; none if it does not compile |
+| source compiled by `eval`/`exec`, and each file served to an `import` | 640 per snippet plus 12 per byte of source, kept for the session; none if it does not compile |
 
 Small ints, floats, bools, `None` and strings short enough to live inside a value cost nothing beyond their slot. An
 object that two names point to is priced once. Garbage that nothing points to stops counting when it is freed; an
@@ -187,11 +187,17 @@ the same point on every machine.
   size for what it was not (read from the constants, not measured as a bound).
 - **Spiking inside one instruction is not seen.** The count is taken between instructions, so a call that holds a large
   temporary while it runs is only seen if the temporary is still there afterwards.
-- **Source compiled by `eval` and `exec` is counted**, because each call keeps its source and code for the life of the
-  session and shares nothing with the last (2,000 `exec('x = 1')` kept 1.29 MB, measured, while the model saw 16 bytes).
-  Measured against the allocator the price is 0.95 to 1.08 of real growth (2,000 `exec`s of one tiny source, of distinct
-  tiny sources, of 200-byte sources, and of `eval`). The code the host feeds is the host's to bound and is not counted.
-- **Not counted:** the host's print buffers, the operand stack's spare capacity, imported module files, and the contents of `csv`, `os.scandir` and open-file objects, which are priced as fixed objects (96 bytes,
+- **Source compiled by `eval` and `exec`, and the files the host serves to an `import`, are counted**, because each keeps
+  its source and code for the life of the session and shares nothing with the last (2,000 `exec('x = 1')` kept 1.29 MB,
+  measured, while the model saw 16 bytes). A file whose body raises is forgotten and read again by the next `import`, so a
+  `try: import m` loop keeps one more copy each time; the model sees it, and a test pins both the price and the stop.
+  Measured against the allocator (release build, Windows, 500 repeats each; model over real): plain statements 0.80 to 1.15
+  (a 6-byte source 0.80, 200 bytes 0.89 to 0.93, 2 KB 1.05 to 1.15), but two shapes of source are far off. Twenty function
+  definitions (about 600 bytes) cost real memory at 1.8 times the model (model 0.56 to 0.59 of real), and 2 KB of comment
+  costs almost nothing real (model 8.1 to 8.6 times real, which errs towards stopping early). Both hold for `eval`/`exec`
+  and for files alike, since they share one path; the `exec` figure of 0.95 to 1.08 given earlier was for plain
+  assignments only. The code the host feeds to the session directly is the host's to bound and is not counted.
+- **Not counted:** the host's print buffers, the operand stack's spare capacity, the path string of an imported file, and the contents of `csv`, `os.scandir` and open-file objects, which are priced as fixed objects (96 bytes,
   or 208 when the payload is boxed).
 - **Capacity must never reach the schedule.** The growth pre-checks that come from buffer capacities (`check_growth`,
   `check_pending_allocation`) are deliberately kept out of the model: a restored list has capacity equal to its length,
