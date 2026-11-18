@@ -893,9 +893,10 @@ fn sig_digits_after_decimal(value: f64) -> usize {
     let before = if value < 1.0 {
         1
     } else {
-        // value is always positive and < 1e6 in practice, so log10 fits in a u32
+        // The whole part is at least 1 here, so `ilog10` exists; counting digits with integers avoids the
+        // platform's `log10`. The cast saturates for huge values, which only ever clamp the result to 0.
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let digits = (value.log10().floor() as u32) + 1;
+        let digits = (value as u64).checked_ilog10().unwrap_or(0) + 1;
         digits as usize
     };
     5usize.saturating_sub(before)

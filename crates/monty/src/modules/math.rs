@@ -38,6 +38,7 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     intern::StaticStrings,
     modules::ModuleFunctions,
+    portable_math,
     resource_checks::{check_mult_size, check_product_size},
     types::{LongInt, Module, PyTrait, allocate_tuple, decimal, long_int::bigint_to_f64_checked},
     value::Value,
@@ -480,7 +481,7 @@ fn math_cbrt(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    Ok(Value::Float(f.cbrt()))
+    Ok(Value::Float(portable_math::cbrt(f)))
 }
 
 /// `math.pow(x, y)` — returns x raised to the power y.
@@ -495,7 +496,7 @@ fn math_pow(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let x = value_to_float(x_val, vm)?;
     let y = value_to_float(y_val, vm)?;
-    let result = x.powf(y);
+    let result = portable_math::powf(x, y);
     // CPython raises ValueError for domain errors: 0**negative, negative**non-integer
     if result.is_nan() && !x.is_nan() && !y.is_nan() {
         return Err(math_domain_error());
@@ -516,7 +517,7 @@ fn math_exp(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    let result = f.exp();
+    let result = portable_math::exp(f);
     check_range_error(result, f)?;
     Ok(Value::Float(result))
 }
@@ -527,7 +528,7 @@ fn math_exp2(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    let result = f.exp2();
+    let result = portable_math::exp2(f);
     check_range_error(result, f)?;
     Ok(Value::Float(result))
 }
@@ -540,7 +541,7 @@ fn math_expm1(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    let result = f.exp_m1();
+    let result = portable_math::exp_m1(f);
     check_range_error(result, f)?;
     Ok(Value::Float(result))
 }
@@ -559,11 +560,11 @@ fn math_log(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(x_val, vm);
     defer_drop!(base_val, vm);
 
-    let numerator = log_arg(x_val, f64::ln, vm)?;
+    let numerator = log_arg(x_val, portable_math::ln, vm)?;
     match base_val {
         Some(base_v) => {
             // `log(1) == 0.0`, so a base of 1 divides by zero as in CPython.
-            let denominator = log_arg(base_v, f64::ln, vm)?;
+            let denominator = log_arg(base_v, portable_math::ln, vm)?;
             if denominator == 0.0 {
                 Err(ExcType::zero_division().into())
             } else {
@@ -651,7 +652,7 @@ fn math_log1p(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
             SimpleException::new_msg(ExcType::ValueError, format!("expected argument value > -1, got {f:?}")).into(),
         );
     }
-    Ok(Value::Float(f.ln_1p()))
+    Ok(Value::Float(portable_math::ln_1p(f)))
 }
 
 /// `math.log2(x)` — returns the base-2 logarithm of x.
@@ -662,7 +663,7 @@ fn math_log2(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("math.log2", vm.heap)?;
     defer_drop!(value, vm);
 
-    Ok(Value::Float(log_arg(value, f64::log2, vm)?))
+    Ok(Value::Float(log_arg(value, portable_math::log2, vm)?))
 }
 
 /// `math.log10(x)` — returns the base-10 logarithm of x.
@@ -673,7 +674,7 @@ fn math_log10(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("math.log10", vm.heap)?;
     defer_drop!(value, vm);
 
-    Ok(Value::Float(log_arg(value, f64::log10, vm)?))
+    Ok(Value::Float(log_arg(value, portable_math::log10, vm)?))
 }
 
 // ==========================
@@ -839,7 +840,7 @@ fn math_sin(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let f = value_to_float(value, vm)?;
     require_finite(f)?;
-    Ok(Value::Float(f.sin()))
+    Ok(Value::Float(portable_math::sin(f)))
 }
 
 /// `math.cos(x)` — returns the cosine of x (in radians).
@@ -849,7 +850,7 @@ fn math_cos(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let f = value_to_float(value, vm)?;
     require_finite(f)?;
-    Ok(Value::Float(f.cos()))
+    Ok(Value::Float(portable_math::cos(f)))
 }
 
 /// `math.tan(x)` — returns the tangent of x (in radians).
@@ -859,7 +860,7 @@ fn math_tan(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let f = value_to_float(value, vm)?;
     require_finite(f)?;
-    Ok(Value::Float(f.tan()))
+    Ok(Value::Float(portable_math::tan(f)))
 }
 
 /// `math.asin(x)` — returns the arc sine of x (in radians).
@@ -871,7 +872,7 @@ fn math_asin(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let f = value_to_float(value, vm)?;
     require_unit_range(f)?;
-    Ok(Value::Float(f.asin()))
+    Ok(Value::Float(portable_math::asin(f)))
 }
 
 /// `math.acos(x)` — returns the arc cosine of x (in radians).
@@ -883,7 +884,7 @@ fn math_acos(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let f = value_to_float(value, vm)?;
     require_unit_range(f)?;
-    Ok(Value::Float(f.acos()))
+    Ok(Value::Float(portable_math::acos(f)))
 }
 
 /// `math.atan(x)` — returns the arc tangent of x (in radians).
@@ -892,7 +893,7 @@ fn math_atan(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    Ok(Value::Float(f.atan()))
+    Ok(Value::Float(portable_math::atan(f)))
 }
 
 /// `math.atan2(y, x)` — returns atan(y/x) in radians, using the signs of both
@@ -904,7 +905,7 @@ fn math_atan2(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let y = value_to_float(y_val, vm)?;
     let x = value_to_float(x_val, vm)?;
-    Ok(Value::Float(y.atan2(x)))
+    Ok(Value::Float(portable_math::atan2(y, x)))
 }
 
 // ==========================
@@ -917,7 +918,7 @@ fn math_sinh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    let result = f.sinh();
+    let result = portable_math::sinh(f);
     check_range_error(result, f)?;
     Ok(Value::Float(result))
 }
@@ -928,7 +929,7 @@ fn math_cosh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    let result = f.cosh();
+    let result = portable_math::cosh(f);
     check_range_error(result, f)?;
     Ok(Value::Float(result))
 }
@@ -939,7 +940,7 @@ fn math_tanh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    Ok(Value::Float(f.tanh()))
+    Ok(Value::Float(portable_math::tanh(f)))
 }
 
 /// `math.asinh(x)` — returns the inverse hyperbolic sine of x.
@@ -948,7 +949,7 @@ fn math_asinh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     defer_drop!(value, vm);
 
     let f = value_to_float(value, vm)?;
-    Ok(Value::Float(f.asinh()))
+    Ok(Value::Float(portable_math::asinh(f)))
 }
 
 /// `math.acosh(x)` — returns the inverse hyperbolic cosine of x.
@@ -966,7 +967,7 @@ fn math_acosh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         )
         .into());
     }
-    Ok(Value::Float(f.acosh()))
+    Ok(Value::Float(portable_math::acosh(f)))
 }
 
 /// `math.atanh(x)` — returns the inverse hyperbolic tangent of x.
@@ -984,7 +985,7 @@ fn math_atanh(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         )
         .into());
     }
-    Ok(Value::Float(f.atanh()))
+    Ok(Value::Float(portable_math::atanh(f)))
 }
 
 // ==========================

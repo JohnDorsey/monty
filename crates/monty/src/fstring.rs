@@ -21,6 +21,7 @@ use crate::{
     expressions::ExprLoc,
     heap::HeapData,
     intern::StringId,
+    portable_math,
     py_value::PyValue,
     resource_checks::check_repeat_size,
     string_builder::StringBuilder,
@@ -2315,7 +2316,7 @@ fn fmt_float_fixed(abs_val: f64, precision: usize, tracker: &ResourceTracker) ->
                 clippy::cast_sign_loss,
                 reason = "`log10` of a finite value >= 1 is in 0..309"
             )]
-            let digits = abs_val.log10() as usize;
+            let digits = portable_math::log10(abs_val) as usize;
             digits + 1
         } else {
             1

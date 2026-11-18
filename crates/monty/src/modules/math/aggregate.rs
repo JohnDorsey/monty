@@ -15,6 +15,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
     heap::DropGuard,
+    portable_math,
     types::{PyTrait, Type, iter::collect_iterable},
     value::Value,
 };
@@ -132,7 +133,7 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
 /// Retains the product's rounding error with fused multiply-add.
 fn two_product(a: f64, b: f64) -> (f64, f64) {
     let product = a * b;
-    (product, a.mul_add(b, -product))
+    (product, portable_math::mul_add(a, b, -product))
 }
 
 /// Sums non-overlapping partials, preserving cancellation and half-even rounding.
@@ -404,7 +405,7 @@ pub(super) fn fma(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let x = value_to_float(x, vm)?;
     let y = value_to_float(y, vm)?;
     let z = value_to_float(z, vm)?;
-    let result = x.mul_add(y, z);
+    let result = portable_math::mul_add(x, y, z);
     if result.is_nan() && !x.is_nan() && !y.is_nan() && !z.is_nan() {
         Err(SimpleException::new_msg(ExcType::ValueError, "invalid operation in fma").into())
     } else if result.is_infinite() && x.is_finite() && y.is_finite() && z.is_finite() {

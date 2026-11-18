@@ -28,6 +28,7 @@ mod object_bridge;
 mod os_dispatch;
 mod parse;
 mod percent_format;
+mod portable_math;
 mod predicate;
 mod prepare;
 mod py_value;
