@@ -1484,6 +1484,18 @@ pub(crate) trait ExcTypeExt: Sized {
         Self::type_error(format!("{dunder} returned non-int (type {type_})"))
     }
 
+    /// A class that set `__bool__ = None` refuses to be truth tested.
+    #[must_use]
+    fn type_error_not_boolean(type_name: &str) -> RunError {
+        Self::type_error(format!("'{type_name}' cannot be interpreted as a boolean"))
+    }
+
+    /// `__bool__` must return an actual bool rather than another truth-testable value.
+    #[must_use]
+    fn type_error_non_bool_return(type_name: &str) -> RunError {
+        Self::type_error(format!("__bool__ should return bool, returned {type_name}"))
+    }
+
     /// Reports a non-numeric argument to a real-valued math function.
     #[must_use]
     fn type_error_not_real_number(type_: &str) -> RunError {

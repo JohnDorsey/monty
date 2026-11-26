@@ -144,7 +144,8 @@ Each links to the page that owns it, which is where the full account lives:
 - **Only the class dunders listed above are dispatched.** `__lt__` and `__len__` raise
     `TypeError` as if undefined, while in-place arithmetic dunders are skipped in favor of binary arithmetic
     (`@=` is rejected at compile time).
-    `__bool__` and the `__getattr__` family are ignored silently, so an instance is always truthy
+    The `__getattr__` family is ignored silently, as is `__len__` in a truth test, so an instance
+    without `__bool__` is truthy
     ([classes.md](classes.md)).
 - **There is no event loop inside the sandbox.** `async` / `await` work, and `asyncio` exposes `run`, `gather`,
     `create_task`, `wait`, `sleep`, `Task`, `InvalidStateError` and the three `wait` constants; everything else

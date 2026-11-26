@@ -252,6 +252,24 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
         call_int_dunder(self.id(), "__int__", vm)
     }
 
+    /// CPython's truth test: `__bool__` if the class has one, which must answer a real `bool`. Without it an
+    /// instance is true; `__len__` is not consulted.
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        let class_id = self.get(vm.heap).class();
+        if matches!(class_dunder(class_id, "__bool__", vm), Some(Value::None)) {
+            Err(ExcType::type_error_not_boolean(&self.py_type_name(vm)))
+        } else if let Some(result) = instance_call_dunder_sync(self.id(), "__bool__", None, vm)? {
+            defer_drop!(result, vm);
+            if let Value::Bool(value) = result {
+                Ok(*value)
+            } else {
+                Err(ExcType::type_error_non_bool_return(&result.py_type_name(vm)))
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
     fn py_float_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<f64>> {
         if let Some(result) = instance_call_dunder_sync(self.id(), "__float__", None, vm)? {
             defer_drop!(result, vm);

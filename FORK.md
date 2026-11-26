@@ -225,6 +225,25 @@ points, independence from the process, overshoot, garbage, shrinking in place, r
 round trip, the worker dispatch (the same message in three workers; a restored session keeps and tightens it), two real
 worker processes behind `monty-pool`, and the Python and JavaScript limits tests.
 
+## Fourth change: `__bool__` on user classes (2026-11-26)
+
+Upstream dispatches no truth hook, so every instance is true. This fork calls `__bool__` with CPython's rules: it must
+return a real `bool`, `__bool__ = None` refuses the truth test, and the class (not the instance) is asked. The behaviour
+and both error messages follow upstream's open pull request 1086 (not merged on 2026-11-26), so that taking it later
+replaces our method and little else. That request also adds `__len__`, which this fork does **not**: a class with only
+`__len__` is still true, where CPython would say false for a length of 0.
+
+The work inside `__bool__` counts against the step budget, it cannot call the host (it runs synchronously, like
+`__eq__`), and one that tests itself raises `RecursionError`. Tests: `test_cases/class__bool.py` (runs on CPython and on
+Monty) and `tests/bool_dunder.rs`.
+
+Verification on Windows after the merge and this change: `monty`, `monty-types` and `monty-runtime` 1,624 tests,
+`monty-proto` 171, `monty-pool` 221, none failing; clippy (past the known `monty-fs` lint) and rustfmt clean; the Python
+and wasm binding crates compile, but the Python and JavaScript test suites were not run again. `monty-datatest` 1,629
+passed and the 3 known failed, with and without `memory-model-checks`. Under that feature `monty`'s own tests have one
+failure, `the_overshoot_is_small_when_the_heap_is_big`: the slow build meets the test's time limit before its memory
+limit, as it did before this change.
+
 ## Verification status (2026-11-16)
 
 - Windows, after the memory limit: `monty`, `monty-types` and `monty-runtime` 1,497 tests, `monty-proto` (with the
