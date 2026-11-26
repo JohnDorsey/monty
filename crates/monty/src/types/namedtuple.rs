@@ -41,10 +41,12 @@ use crate::{
     modules::copy::{Memo, PyDeepCopy, deep_copy_slots},
     resource_checks::{check_repeat_size, repeated_len},
     types::{
-        Dict, Type, TypeRef, Union, allocate_tuple,
+        Dict, Slice, Type, TypeRef, Union, allocate_tuple,
         instance::BoundMethod,
         iter::collect_owned_iterable,
+        key_hash::hash_or_culprit,
         py_trait::LazyHeapSet,
+        sequence::SequenceItems,
         slice::{normalize_sequence_index, slice_collect_iterator, value_to_i64_bound},
         str::allocate_string,
         tuple::TupleVec,
@@ -229,7 +231,7 @@ impl<'h> HeapRead<'h, NamedTuple> {
             vm.heap.inc_ref(class_id);
         }
         let named = NamedTuple::with_class(name, field_names, items, class_id);
-        Value::Ref(vm.heap.allocate(HeapData::NamedTuple(Box::new(named))))
+        Value::allocate(named, vm.heap)
     }
 
     /// Returns `Some(value)` if the index is in bounds, `None` otherwise.
@@ -268,6 +270,27 @@ impl<'h> HeapRead<'h, NamedTuple> {
     #[expect(clippy::iter_not_returning_iterator)]
     pub(crate) fn iter(&self, vm: &mut VM<'h>) -> RunResult<NamedTupleIter<'_, 'h>> {
         NamedTupleIter::new(self, vm)
+    }
+
+    /// Hashes by element only (not by class name), matching the tuple hash so a
+    /// `NamedTuple` and a `Tuple` with equal elements hash equally; on failure
+    /// returns the innermost unhashable item's type name, as the tuple one does.
+    pub(crate) fn hash_or_culprit(&self, vm: &mut VM<'h>) -> RunResult<Result<HashValue, String>> {
+        if let Some(cached) = self.get(vm.heap).cached_hash.get() {
+            return Ok(Ok(cached));
+        }
+        let mut hasher = DefaultHasher::new();
+        let iter = self.iter(vm)?;
+        defer_drop_mut!(iter, vm);
+        while let Some(item) = iter.next(vm)? {
+            match hash_or_culprit(item, vm)? {
+                Ok(hash) => hash.hash(&mut hasher),
+                Err(culprit) => return Ok(Err(culprit)),
+            }
+        }
+        let hash = HashValue::new(hasher.finish());
+        self.get(vm.heap).cached_hash.set(Some(hash));
+        Ok(Ok(hash))
     }
 
     /// Cross-type equality between NamedTuple and Tuple via HeapRead.
@@ -399,9 +422,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
     fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
         // A slice degrades to a plain tuple, as in CPython — the field names
         // describe the original instance only, so they cannot survive a slice.
-        if let Value::Ref(key_id) = key
-            && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
-        {
+        if let Some(slice_obj) = key.get_as::<Slice>(vm.heap) {
             let items = slice_collect_iterator(vm, slice_obj, self.get(vm.heap).as_vec().iter(), |v| {
                 v.clone_with_heap(vm)
             })?;
@@ -509,26 +530,9 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
         }
     }
 
-    /// Hashes by element only (not by class name), matching `Tuple::py_hash`
-    /// so a `NamedTuple` and a `Tuple` with equal elements share the same hash.
-    /// Caches the computed hash on first call (see `Tuple::py_hash` for the
-    /// caching rationale).
+    /// See [`HeapRead::hash_or_culprit`], which also names an unhashable item.
     fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        if let Some(cached) = self.get(vm.heap).cached_hash.get() {
-            return Ok(Some(cached));
-        }
-        let mut hasher = DefaultHasher::new();
-        let iter = self.iter(vm)?;
-        defer_drop_mut!(iter, vm);
-        while let Some(item) = iter.next(vm)? {
-            match item.py_hash(vm)? {
-                Some(h) => h.hash(&mut hasher),
-                None => return Ok(None),
-            }
-        }
-        let hash = HashValue::new(hasher.finish());
-        self.get(vm.heap).cached_hash.set(Some(hash));
-        Ok(Some(hash))
+        Ok(self.hash_or_culprit(vm)?.ok())
     }
 
     fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
@@ -757,7 +761,7 @@ impl<'h> HeapRead<'h, NamedTuple> {
             pairs.push((key, value));
         }
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
+        Ok(Value::allocate(dict, vm.heap))
     }
 
     /// `p._replace(**kwargs)` — a copy with the named fields overridden.
@@ -1004,7 +1008,7 @@ impl<'h> HeapRead<'h, NamedTupleClass> {
             pairs.push((key, value));
         }
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
+        Ok(Value::allocate(dict, vm.heap))
     }
 }
 
@@ -1124,26 +1128,8 @@ pub(crate) fn cmp_item_seqs(a: Vec<Value>, b: Vec<Value>, vm: &mut VM<'_>) -> Ru
 /// Shared by named-tuple concatenation (`+`), whose result is always a plain
 /// tuple regardless of which operand is the namedtuple.
 fn cloned_tuple_like_items(value: &Value, vm: &VM<'_>) -> RunResult<Option<Vec<Value>>> {
-    let Value::Ref(id) = value else {
-        return Ok(None);
-    };
-    let id = *id;
-    let len = match vm.heap.get(id) {
-        HeapData::Tuple(t) => t.as_slice().len(),
-        HeapData::NamedTuple(nt) => nt.as_vec().len(),
-        _ => return Ok(None),
-    };
-    vm.heap.tracker.check_allocation(len.saturating_mul(VALUE_SIZE))?;
-    let mut items = Vec::with_capacity(len);
-    for i in 0..len {
-        let item = match vm.heap.get(id) {
-            HeapData::Tuple(t) => t.as_slice()[i].clone_with_heap(vm.heap),
-            HeapData::NamedTuple(nt) => nt.as_vec()[i].clone_with_heap(vm.heap),
-            _ => unreachable!("length branch already matched a tuple-like variant"),
-        };
-        items.push(item);
-    }
-    Ok(Some(items))
+    let items = value.ref_id().and_then(|id| SequenceItems::from_tuple(vm.heap.get(id)));
+    items.map(|items| items.to_vec(vm.heap)).transpose()
 }
 
 /// Builds the synthesised class docstring, e.g. `Point(x, y)`.

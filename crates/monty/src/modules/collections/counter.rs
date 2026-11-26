@@ -18,11 +18,13 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     expressions::CmpOperator,
-    heap::{DropGuard, DropWithContext, HeapData, HeapObjectRead, HeapReadOutput},
+    heap::{DropGuard, DropWithContext, HeapData, HeapObjectRead},
     py_value::PyValue,
     resource_checks::check_repeat_size,
     sorting::{py_eq_item, py_lt, sort_indices, sort_indices_by},
-    types::{Dict, List, PyTrait, allocate_tuple, iter::collect_owned_iterable, py_trait::CmpOrder},
+    types::{
+        Dict, List, PyTrait, allocate_tuple, iter::collect_owned_iterable, key_hash::plain_hash, py_trait::CmpOrder,
+    },
     value::{VALUE_SIZE, Value},
 };
 
@@ -214,7 +216,12 @@ pub(crate) fn counter_update<'h>(
             // items it never reached.
             defer_drop_mut!(items, vm);
             for item in items.by_ref() {
-                counter_bump(counter, item, &Value::Int(1), subtract, false, vm)?;
+                // `subtract` is pure Python (`self.get(elem, 0) - 1`), keeping the dict key error.
+                if subtract {
+                    counter_bump(counter, item, &Value::Int(1), true, false, vm)?;
+                } else {
+                    counter_count_element(counter, item, vm)?;
+                }
             }
         }
     }
@@ -225,6 +232,24 @@ pub(crate) fn counter_update<'h>(
     let (kwargs, vm) = kwargs_guard.into_parts();
     let kwarg_pairs = counter_kwarg_deltas(kwargs);
     counter_merge_mapping(counter, kwarg_pairs, subtract, vm)?;
+    Ok(())
+}
+
+/// Counts one occurrence of `item` as `_count_elements` does: one bare
+/// `PyObject_Hash`, reused for the lookup and the store, so an unhashable item
+/// raises `hash()`'s error rather than the dict key one.
+fn counter_count_element<'h>(counter: &mut HeapObjectRead<'h, Dict>, item: Value, vm: &mut VM<'h>) -> RunResult<()> {
+    let mut item_guard = DropGuard::new(item, vm);
+    let (item, vm) = item_guard.as_parts_mut();
+    let hash = plain_hash(item, vm)?.raw();
+    let base = counter.get_known_hash(item, hash, vm)?.unwrap_or(Value::Int(0));
+    let total = count_arith(&base, &Value::Int(1), false, vm);
+    base.drop_with(vm);
+    let total = total?;
+    let (item, vm) = item_guard.into_parts();
+    if let Some(old) = counter.set_known_hash(item, total, hash, vm)? {
+        old.drop_with(vm);
+    }
     Ok(())
 }
 
@@ -368,7 +393,7 @@ pub(crate) fn counter_most_common<'h>(
 
     // CPython's `heapq.nlargest(0, ...)` returns before comparing anything.
     if limit == Some(0) {
-        return Ok(vm.heap.allocate_as(List::new(Vec::new())).into_value());
+        return Ok(Value::allocate(List::new(Vec::new()), vm.heap));
     }
     // Snapshot the entries before ordering: comparing counts can run a user
     // `__eq__` that mutates the Counter, so the ordered indices must refer to
@@ -397,7 +422,7 @@ pub(crate) fn counter_most_common<'h>(
             )
         })
         .collect();
-    Ok(vm.heap.allocate_as(List::new(items)).into_value())
+    Ok(Value::allocate(List::new(items), vm.heap))
 }
 
 /// Indices of the `n` largest of `counts` (`n > 0`), largest first, picked as CPython's
@@ -565,7 +590,7 @@ pub(crate) fn counter_elements<'h>(
             items.push(key.clone_with_heap(vm.heap));
         }
     }
-    Ok(vm.heap.allocate_as(List::new(items)).into_value())
+    Ok(Value::allocate(List::new(items), vm.heap))
 }
 
 /// The four binary `Counter` algebra operators.
@@ -985,10 +1010,8 @@ fn counter_bump_all<'h>(
 /// CPython's `AttributeError: 'X' object has no attribute 'items'` — the failure
 /// `c += other` / `-=` / `|=` hit when `other.items()` has no `.items()`.
 fn counter_require_mapping<'h>(rhs: &Value, vm: &VM<'h>) -> RunResult<HeapObjectRead<'h, Dict>> {
-    match rhs.read_heap(vm) {
-        Some(HeapReadOutput::Dict(dict)) => Ok(dict),
-        _ => Err(ExcType::attribute_error(rhs.py_type_name(vm), "items")),
-    }
+    rhs.read_as::<Dict>(vm.heap)
+        .ok_or_else(|| ExcType::attribute_error(rhs.py_type_name(vm), "items"))
 }
 
 /// Removes every entry whose count is not strictly positive from `counter`.

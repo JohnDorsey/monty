@@ -21,6 +21,7 @@ use crate::{
     types::{
         LazyHeapSet, Type, TypeRef,
         hash_table::{CloneTableEntry, Live, PyHashTable, TableCursor, TableEntry, TableProbe, TableSource, TableWalk},
+        key_hash::{HashRole, hash_as, set_element_hash},
         list::repr_items_fmt,
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -122,9 +123,14 @@ impl SetStorage {
     /// The caller transfers ownership of `value`. If the value is already in
     /// the set, it will be dropped.
     fn add(&mut self, value: Value, vm: &mut VM<'_>) -> RunResult<bool> {
+        self.add_as(value, HashRole::SetElement, vm)
+    }
+
+    /// [`Self::add`], reporting a hashing error as `role` does.
+    fn add_as(&mut self, value: Value, role: HashRole, vm: &mut VM<'_>) -> RunResult<bool> {
         let mut value_guard = DropGuard::new(value, vm);
         let (value, vm) = value_guard.as_parts();
-        let hash = set_element_hash(value, vm)?;
+        let hash = hash_as(value, role, vm)?;
         let (value, vm) = value_guard.into_parts();
         self.add_with_hash(value, hash, vm)
     }
@@ -246,7 +252,7 @@ impl<'h> HeapRead<'h, SetStorage> {
 
     /// Method forms accept any iterable, whose owned snapshot must survive comparison callbacks.
     fn algebra_from_value(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<SetStorage> {
-        let Set(other_storage) = Set::from_iterable(other, vm)?;
+        let Set(other_storage) = Set::from_iterable_as(other, op.hash_role(), vm)?;
         defer_drop!(other_storage, vm);
         let other_storage = vm.heap.protect(other_storage);
         self.algebra(&other_storage, op, vm)
@@ -257,7 +263,7 @@ impl<'h> HeapRead<'h, SetStorage> {
         let other_storage = if let Some(storage) = copy_storage_from_set(other, vm)? {
             storage
         } else {
-            Set::from_iterable(other.clone_with_heap(vm), vm)?.0
+            Set::from_iterable_as(other.clone_with_heap(vm), op.hash_role(), vm)?.0
         };
         defer_drop!(other_storage, vm);
 
@@ -806,8 +812,7 @@ impl Set {
             None => Self::new(),
             Some(v) => Self::from_iterable(v, vm)?,
         };
-        let heap_id = vm.heap.allocate(HeapData::Set(set));
-        Ok(Value::Ref(heap_id))
+        Ok(Value::allocate(set, vm.heap))
     }
 
     /// Creates a set from an iterable value, adding and hashing items incrementally.
@@ -818,6 +823,11 @@ impl Set {
     /// checkpoints, so it is preflighted: otherwise only the allocator's hard
     /// ceiling would stop `set(huge)`, killing the worker.
     fn from_iterable(iterable: Value, vm: &mut VM<'_>) -> RunResult<Self> {
+        Self::from_iterable_as(iterable, HashRole::SetElement, vm)
+    }
+
+    /// [`Self::from_iterable`], reporting a hashing error as `role` does.
+    fn from_iterable_as(iterable: Value, role: HashRole, vm: &mut VM<'_>) -> RunResult<Self> {
         // The preflight can refuse the copy, so the argument rides in a guard;
         // only the iterator path below takes it back.
         let mut guard = DropGuard::new(iterable, vm);
@@ -843,7 +853,7 @@ impl Set {
             let Some(item) = iterator.py_next(vm)? else {
                 break;
             };
-            set.add(item, vm)?;
+            set.0.add_as(item, role, vm)?;
         }
         Ok(set_guard.into_inner())
     }
@@ -1016,13 +1026,18 @@ impl<'h> HeapRead<'h, Set> {
         self.storage().contains(value, vm)
     }
 
+    /// `self.intersection(other)` for an owned iterable `other`, hashing its
+    /// items bare as CPython's `set.intersection` does. Used by dict views.
+    pub(crate) fn intersection_with(&self, other: Value, vm: &mut VM<'h>) -> RunResult<Value> {
+        self.set_algebra(other, SetAlgebra::Intersection, vm)
+    }
+
     /// Wraps shared storage algebra as a mutable set; method forms accept any iterable.
     // Keep result allocation out of native method dispatch's stack frame.
     #[inline(never)]
     fn set_algebra(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<Value> {
         let result = self.storage().algebra_from_value(other, op, vm)?;
-        let heap_id = vm.heap.allocate(HeapData::Set(Set(result)));
-        Ok(Value::Ref(heap_id))
+        Ok(Value::allocate(Set(result), vm.heap))
     }
 }
 
@@ -1041,6 +1056,27 @@ enum SetComparison {
     Subset,
     Superset,
     Disjoint,
+}
+
+impl SetAlgebra {
+    /// CPython's `set.intersection` hashes a non-set argument's items with a bare
+    /// `PyObject_Hash`, so its errors are not wrapped as a set element's.
+    fn hash_role(self) -> HashRole {
+        match self {
+            Self::Intersection => HashRole::Plain,
+            Self::Union | Self::Difference | Self::SymmetricDifference => HashRole::SetElement,
+        }
+    }
+}
+
+impl SetComparison {
+    /// CPython's `issubset` runs `set.intersection` on a non-set argument; see [`SetAlgebra::hash_role`].
+    fn hash_role(self) -> HashRole {
+        match self {
+            Self::Subset => HashRole::Plain,
+            Self::Superset | Self::Disjoint => HashRole::SetElement,
+        }
+    }
 }
 
 impl<C: ContainsHeap> DropWithContext<C> for Set {
@@ -1101,8 +1137,7 @@ impl<'h> HeapRead<'h, FrozenSet> {
     #[inline(never)]
     fn set_algebra(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<Value> {
         let result = self.storage().algebra_from_value(other, op, vm)?;
-        let heap_id = vm.heap.allocate(HeapData::FrozenSet(FrozenSet::wrap(result)));
-        Ok(Value::Ref(heap_id))
+        Ok(Value::allocate(FrozenSet::wrap(result), vm.heap))
     }
 
     /// Keeps allocating storage methods out of the identity-copy dispatch frame.
@@ -1226,32 +1261,28 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         let Some(result) = self.sub_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::Set(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_and_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.and_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::Set(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_or_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.or_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::Set(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_xor_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.xor_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::Set(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_isub_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
@@ -1305,8 +1336,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
             Some(StaticStrings::Copy) => {
                 args.check_zero_args("set.copy", vm.heap)?;
                 let copy = self.copy(vm)?;
-                let heap_id = vm.heap.allocate(HeapData::Set(copy));
-                Ok(Value::Ref(heap_id))
+                Ok(Value::allocate(copy, vm.heap))
             }
             Some(StaticStrings::Update) => {
                 let other = args.get_one_arg("set.update", vm.heap)?;
@@ -1479,8 +1509,7 @@ impl FrozenSet {
                     None => Self::new(),
                     Some(v) => Self::from_set(Set::from_iterable(v, vm)?),
                 };
-                let heap_id = vm.heap.allocate(HeapData::FrozenSet(frozenset));
-                Ok(Value::Ref(heap_id))
+                Ok(Value::allocate(frozenset, vm.heap))
             }
         }
     }
@@ -1526,24 +1555,25 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, FrozenSet> {
         }
     }
 
-    /// Hashes the frozenset by XORing all element hashes.
+    /// Hashes the frozenset by XORing the element hashes stored with its entries.
     ///
     /// XOR is commutative, so the hash is independent of insertion order — two
     /// frozensets with the same members hash equally regardless of how they were built.
+    /// Like CPython, it never re-hashes a member, so no user `__hash__` runs and none can fail.
     /// Caches the computed hash on first call (frozensets are immutable).
     fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        if let Some(cached) = self.get(vm.heap).cached_hash.get() {
+        let frozenset = self.get(vm.heap);
+        if let Some(cached) = frozenset.cached_hash.get() {
             return Ok(Some(cached));
         }
-        let mut hash: u64 = 0;
-        let storage = self.storage();
-        let iter = storage.iter(vm)?;
-        defer_drop_mut!(iter, vm);
-        while let Some(item) = iter.next(vm)? {
-            hash ^= set_element_hash(item, vm)?;
+        let mut hash = 0;
+        for (i, entry) in frozenset.storage.live().enumerate() {
+            // A large frozenset must not delay the execution deadline.
+            vm.heap.tracker.check_time_every(i)?;
+            hash ^= entry.hash;
         }
         let hash = HashValue::new(hash);
-        self.get(vm.heap).cached_hash.set(Some(hash));
+        frozenset.cached_hash.set(Some(hash));
         Ok(Some(hash))
     }
 
@@ -1555,32 +1585,28 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, FrozenSet> {
         let Some(result) = self.sub_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::FrozenSet(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_and_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.and_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::FrozenSet(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_or_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.or_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::FrozenSet(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_xor_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(result) = self.xor_value(other, vm)? else {
             return Ok(None);
         };
-        let result_id = vm.heap.allocate(HeapData::FrozenSet(result));
-        Ok(Some(Value::Ref(result_id)))
+        Ok(Some(Value::allocate(result, vm.heap)))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
@@ -1757,7 +1783,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, SetIterator> {
         Ok(CallResult::Value(self.clone_value(vm.heap)))
     }
 
-    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
         // The cursor lives in this heap entry and the table in another, so a
         // copy is stepped under the storage borrow and stored back after. A
         // frozen set cannot change size, so its length check is a no-op
@@ -1777,49 +1803,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, SetIterator> {
         };
         // Stored back on an error too: the error is sticky, as in CPython.
         self.get_mut(vm.heap).cursor = cursor;
-        value
+        value.map(|item| item.map(CallResult::Value))
     }
-}
-
-/// Hashes a value about to become a set element, raising CPython's
-/// `cannot use 'T' as a set element (unhashable type: 'U')` when it cannot be.
-pub(crate) fn set_element_hash(value: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
-    if let Some(hash) = value.py_hash(vm)? {
-        Ok(hash.raw())
-    } else {
-        let element_type = value.py_type_name(vm).into_owned();
-        let unhashable_type = unhashable_type_name(value, vm)?;
-        Err(ExcType::type_error_unhashable_set_element(
-            &element_type,
-            &unhashable_type,
-        ))
-    }
-}
-
-/// Finds the nested value responsible for a tuple-like element being unhashable.
-pub(crate) fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
-    let Value::Ref(id) = value else {
-        return Ok(value.py_type_name(vm).into_owned());
-    };
-    let len = match vm.heap.get(*id) {
-        HeapData::Tuple(tuple) => tuple.as_slice().len(),
-        HeapData::NamedTuple(namedtuple) => namedtuple.as_vec().len(),
-        _ => return Ok(value.py_type_name(vm).into_owned()),
-    };
-
-    for index in 0..len {
-        let item = match vm.heap.get(*id) {
-            HeapData::Tuple(tuple) => tuple.as_slice()[index].clone_with_heap(vm.heap),
-            HeapData::NamedTuple(namedtuple) => namedtuple.as_vec()[index].clone_with_heap(vm.heap),
-            _ => unreachable!("tuple-like heap value changed type"),
-        };
-        defer_drop!(item, vm);
-        if item.py_hash(vm)?.is_none() {
-            return unhashable_type_name(item, vm);
-        }
-    }
-
-    Ok(value.py_type_name(vm).into_owned())
 }
 
 impl<'h> PyDeepCopy<'h> for HeapRead<'h, Set> {
@@ -1881,8 +1866,6 @@ impl<'h> PyDeepCopy<'h> for HeapRead<'h, FrozenSet> {
             built.add(copied, vm)?;
         }
         let (built, vm) = guard.into_parts();
-        Ok(Value::Ref(
-            vm.heap.allocate(HeapData::FrozenSet(FrozenSet::from_set(built))),
-        ))
+        Ok(Value::allocate(FrozenSet::from_set(built), vm.heap))
     }
 }

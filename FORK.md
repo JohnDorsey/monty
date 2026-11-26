@@ -263,6 +263,24 @@ tracker once per entry, so the method-level charges for dict and set copies and 
 counting them twice; on the `v1.6.0` line they are still needed. Count drift is the risk of following upstream: watch
 `GOLDEN_STEPS` in `tests/step_budget.rs` at every merge.
 
+Merged again on 2026-11-26 (upstream `main` at `a96e6bd7`, 55 commits, past v1.7.0; four small conflicts). Upstream
+still used wire protocol 9, so ours stays 11. What the merge needed and showed:
+
+- Three new heap payloads, `asyncio.Task`, `asyncio.wait`'s awaitable and the `map`/`filter` iterator, were refused by the
+  memory model's exhaustive match until priced. A task costs its name (the script chooses it) and one reference an awaiter;
+  a pending wait one reference per entry it holds.
+- The 286-operation method sweep and the builtin audit gave the same step counts and outcomes before and after, but for one
+  case: sorting strings short enough to live inside the value now takes about 1 step an item instead of about 17. Upstream's
+  `Value::as_str` made them reach the fast sort that numbers always took, whose comparisons were never charged. Nothing we
+  charge was removed; the sort is also faster (70 ms to 44 ms for 300,000).
+- **One upstream test case fails on this fork, and has since the first change:** `test_cases/math__module.py` asserts
+  `math.exp(1) == math.e`, and `libm::exp(1.0)` is one unit in the last place above `math.e`. It was not seen because
+  `monty-datatest` had not been run here (2026-11-26 is its first run; it needs a Python 3.14 library on `PATH`). The test
+  is left as upstream wrote it until it is decided whether to change the function or the assertion. It affects the
+  upstream-facing branch `portable-float-math` in the same way.
+- The same run fails `complex__all.py` and `time__struct_time.py` in their CPython half (CPython 3.14.10 on Windows), which
+  runs no code of this fork.
+
 ## What is deliberately not changed
 
 - `sqrt`, `floor`, `ceil`, `trunc`, `abs`, `copysign`, `%` are exact by definition.

@@ -28,6 +28,7 @@ use crate::{
         LazyHeapSet, PyTrait, Type, TypeRef,
         host_class::write_dataclass_repr,
         instance::{class_dunder, class_name, instance_attr},
+        key_hash::plain_hash,
         py_trait::PyObjectIdentity,
         str::allocate_string,
     },
@@ -395,10 +396,9 @@ pub(crate) fn generated_fields(class_id: HeapId, dunder: &str, vm: &VM<'_>) -> O
 
 /// Whether `value` is a generated `__init__`, which construction calls directly.
 pub(crate) fn is_generated_init(value: &Value, vm: &VM<'_>) -> bool {
-    matches!(value, Value::Ref(id) if matches!(
-        vm.heap.get(*id),
-        HeapData::DataclassMethod(method) if matches!(method.kind, MethodKind::Init(_))
-    ))
+    value
+        .get_as::<DataclassMethod>(vm.heap)
+        .is_some_and(|method| matches!(method.kind, MethodKind::Init(_)))
 }
 
 /// The error assigning `name` raises on an instance of `class_id`, or `None`
@@ -738,10 +738,7 @@ pub(crate) fn dataclass_hash(self_id: HeapId, field_names: &[StringId], vm: &mut
             let class_name = class_name(class_id, vm.heap, vm.interns).into_owned();
             return Err(ExcType::attribute_error(&class_name, &field_name));
         };
-        match value.py_hash(vm)? {
-            Some(h) => h.hash(&mut hasher),
-            None => return Err(ExcType::type_error_unhashable(&value.py_type_name(vm))),
-        }
+        plain_hash(value, vm)?.hash(&mut hasher);
     }
     Ok(HashValue::new(hasher.finish()))
 }

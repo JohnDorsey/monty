@@ -111,6 +111,9 @@ impl HeapData {
             Self::ReMatch(matched) => BOXED_BODY_BYTES + matched.text_bytes() + matched.group_count() * VALUE_BYTES,
             Self::Partial(partial) => BOXED_BODY_BYTES + partial.slot_count() * VALUE_BYTES,
             Self::LruCache(cache) => BOXED_BODY_BYTES + cache.entry_count() * CACHE_ENTRY_BYTES,
+            // A task's name is the script's to choose (`set_name`), and every await of it adds an awaiter.
+            Self::Task(task) => BOXED_BODY_BYTES + task.name.len() + task.awaiters.len() * REFERENCE_BYTES,
+            Self::WaitFuture(wait) => BOXED_BODY_BYTES + wait.held_references() * REFERENCE_BYTES,
             // Boxed objects whose state is the box: the generator's and the hash's state is the price.
             Self::Random(_) => RANDOM_STATE_BYTES,
             Self::HashObject(_) => HASH_STATE_BYTES,
@@ -121,6 +124,7 @@ impl HeapData {
             | Self::DataclassMethod(_)
             | Self::ExternalFuture(_)
             | Self::OpenFile(_)
+            | Self::MapFilter(_)
             | Self::ForwardRef(_)
             | Self::DirScan(_)
             | Self::Csv(_) => BOXED_BODY_BYTES,

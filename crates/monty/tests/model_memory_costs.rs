@@ -265,3 +265,22 @@ fn the_count_is_the_same_after_a_dump_and_restore() {
     };
     assert_eq!(restored.model_bytes(), before);
 }
+
+#[test]
+fn a_task_costs_its_name_which_the_script_chooses() {
+    let setup = "
+import asyncio
+
+async def idle():
+    return 1
+
+async def named(name):
+    task = asyncio.create_task(idle())
+    task.set_name(name)
+    await task
+    return task
+";
+    let short = cost_of(setup, "await named('n' * 100)");
+    let long = cost_of(setup, "await named('n' * 5100)");
+    assert_eq!(long - short, 5000);
+}

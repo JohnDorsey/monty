@@ -1,11 +1,7 @@
 //! Implementation of the hash() builtin function.
 
 use crate::{
-    args::ArgValues,
-    bytecode::VM,
-    defer_drop,
-    exception_private::{ExcType, ExcTypeExt, RunResult},
-    native_work,
+    args::ArgValues, bytecode::VM, defer_drop, exception_private::RunResult, native_work, types::key_hash::plain_hash,
     value::Value,
 };
 
@@ -17,11 +13,6 @@ pub fn builtin_hash(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("hash", vm.heap)?;
     defer_drop!(value, vm);
     native_work::charge(vm, native_work::scan_steps(value, vm))?;
-    match value.py_hash(vm)? {
-        Some(hash) => {
-            // Python's hash() returns a signed integer; reinterpret bits for large values
-            Ok(Value::Int(hash.raw().cast_signed()))
-        }
-        None => Err(ExcType::type_error_unhashable(&value.py_type_name(vm))),
-    }
+    // Python's hash() returns a signed integer; reinterpret bits for large values
+    Ok(Value::Int(plain_hash(value, vm)?.raw().cast_signed()))
 }

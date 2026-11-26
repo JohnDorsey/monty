@@ -43,6 +43,9 @@ works on classes; see [classes.md](classes.md#inheritance).
     `AttributeError`, so `[1].append`, `'a'.upper`, `{}.get`, `dict.fromkeys`
     and `list.__class_getitem__` cannot be assigned, passed as a callback or
     reached through `getattr`. Call them directly (`list.__class_getitem__(int)`).
+- **`str.translate()`** — a table entry (from a dict or `str.maketrans()`) that maps to a surrogate code point
+    (`0xD800`–`0xDFFF`) raises `ValueError: character mapping must be in range(0x110000)`, because Monty strings cannot
+    hold lone surrogates.
 - **Large integer literal identity** — separate occurrences of the same literal outside the `i64` range are not
     deduplicated, so `a = 18446744073709551616; b = 18446744073709551616; a is b` is `False` where CPython may reuse a
     single constant and return `True`.
@@ -114,35 +117,28 @@ works on classes; see [classes.md](classes.md#inheritance).
     In-place `|=`, `-=`, `^=`, and `&=` also snapshot their right operand before mutation.
     Changes to that operand made by user `__eq__` are not observed.
 - **Dict-view set operators re-hash the view's own keys** — `d.keys() - s`,
-    `|`, `^`, `isdisjoint` and the reflected forms collect those keys through a
+    `|`, `^` and their reflected forms collect those keys through a
     live, resize-checked walk that calls `__hash__` on each one. CPython probes
     with each key's stored hash and mostly does not call it at all. So a
     `__hash__` — or a colliding `__eq__` — that resizes the dict raises
     `RuntimeError: dictionary changed size during iteration` in Monty where
     CPython completes, as in `d.keys() - s`; CPython raises too wherever its own
     walk observes the change, as in `s - d.keys()` and `d.items() - s`.
-    `d.keys() & s` diverges the other way: Monty always walks the other operand
-    and probes the live dict, so the view's keys are never hashed and the
-    intersection completes, while CPython walks the view whenever the dict is no
-    larger than the other operand — hashing each of its keys into that operand —
-    and so raises where Monty returns a result.
-    The operand that is *not* the view is snapshotted before the operation
-    begins, so mutating that one is never observed. Absent mutation every result
-    agrees. Set-to-set operators do not re-hash at all, and dict-view equality
-    (`d.keys() == s`) raises exactly where CPython does.
-- **`enumerate`, `zip`, `map`, `filter` and `reversed` are eager, not lazy** —
-    each drains its source and returns a `list`, so `type(enumerate(x)).__name__`
-    is `'list'` rather than `'enumerate'`. Observable several ways: a
-    side-effecting callable runs for every item at the call itself rather than as
-    the result is consumed; the whole result is held in memory at once, so an
-    infinite iterator (e.g. `map(f, itertools.count())`) never returns and runs
-    until a resource limit trips; the result can be indexed and re-iterated, which
-    CPython forbids; and mutating the source from inside the loop body is never
-    observed, so containers that detect mutation during iteration (`dict`, `set`,
-    `collections.deque`) will not raise when looped over via one of these. `zip`
-    and multi-iterable `map` stop at the shortest input, so pairing an infinite
-    iterable with a finite or empty one stays bounded. A plain `for x in container` is lazy and does detect mutation.
+    The operand that is *not* the view is snapshotted before these operators
+    begin, so mutating that one is never observed. Absent mutation every result
+    agrees. `&` and `isdisjoint` walk and probe the same operands as CPython, set-to-set operators do not
+    re-hash at all, and dict-view equality (`d.keys() == s`) raises exactly where CPython does.
+- **`enumerate`, `zip` and `reversed` are eager, not lazy** — each returns a `list`, so
+    `type(enumerate(x)).__name__` is `'list'` rather than `'enumerate'`.
+    The whole result is held in memory, and `enumerate(itertools.count())` never returns until a resource limit trips.
+    Results can be indexed and re-iterated, unlike CPython's iterators.
+    Mutating the source from inside the loop body is not observed, so `dict`, `set` and `collections.deque` do not
+    report mutation during iteration through these builtins.
+    `zip` stops at the shortest input, so pairing an infinite iterable with a finite or empty one stays bounded.
     See [itertools.md](itertools.md).
+- **`map` and `filter` callbacks cannot suspend through synchronous consumers**, such as `list(map(f, xs))`.
+    Use a comprehension or explicit `next()` when the callback needs to call the host.
+    Their iterator attributes have the restrictions listed in [iter.md](iter.md).
 - **Arity-error wording for some str/bytes methods** — a handful of
     keyword-accepting methods (e.g. `str.split`, `str.rsplit` and the `bytes`
     equivalents) report too-many-arguments as `split expected at most 2 arguments, got 3`, where CPython 3.14's Argument
@@ -178,11 +174,9 @@ works on classes; see [classes.md](classes.md#inheritance).
     text as one string rather than CPython's `(34, '...')` tuple.
 - **`sorted(iterable, *, key=None, reverse=False)`** — `key` and `reverse`
     must be passed by keyword; positional forms raise `TypeError`.
-- **`round(n, ndigits)`** — `ndigits` values outside the i64 range are
-    clamped by sign. For floats this matches CPython (which clamps to
-    `Py_ssize_t`); for an int `n` with a hugely negative `ndigits`, CPython
-    tries to materialise `10**-ndigits` and dies with `MemoryError` where
-    Monty returns `0` immediately.
+- **`round(n, ndigits)` for an int `n`** — `ndigits` values outside the i64 range are clamped by sign.
+    For a hugely negative `ndigits`, CPython tries to materialise `10**-ndigits` and dies with `MemoryError`
+    where Monty returns `0` immediately.
 - **`print`** — writes via the host print callback. `file=`, `flush=` are
     not honoured; `sep=` and `end=` are.
 - **Identity of host-supplied callables** — host functions passed in as inputs

@@ -24,6 +24,7 @@ use crate::{
     types::{
         Dict, LazyHeapSet, NamedTuple, PyTrait, Type, TypeRef,
         hash_table::{PyHashTable, Slot, TableEntry, TableProbe, TableSource},
+        key_hash::plain_hash,
         tuple::{TupleVec, allocate_tuple},
     },
     value::{EitherStr, Value},
@@ -162,7 +163,7 @@ pub(crate) fn call(cache_id: HeapId, args: ArgValues, vm: &mut VM<'_>) -> RunRes
     } else {
         cache.get_mut(vm.heap).misses += 1;
         let kwargs = Dict::from_pairs(take(keywords), vm)?;
-        let kwargs = Value::Ref(vm.heap.allocate(HeapData::Dict(kwargs)));
+        let kwargs = Value::allocate(kwargs, vm.heap);
         let args = allocate_tuple(TupleVec::from_vec(take(positional)), vm.heap);
         let store = Value::ModuleFunction(ModuleFunctions::Frozen(FrozenFunctions::Store));
         let function = func.clone_with_heap(vm);
@@ -207,7 +208,7 @@ fn decorate(maxsize: Option<u64>, typed: bool, args: ArgValues, vm: &mut VM<'_>)
 pub(crate) fn allocate(func: Option<Value>, maxsize: Option<u64>, typed: bool, vm: &mut VM<'_>) -> RunResult<Value> {
     if func.as_ref().is_none_or(|func| func.is_callable(vm)) {
         let cache = LruCache::new(func, maxsize, typed);
-        Ok(Value::Ref(vm.heap.allocate(HeapData::LruCache(Box::new(cache)))))
+        Ok(Value::allocate(cache, vm.heap))
     } else {
         func.drop_with(vm);
         Err(ExcType::partial_not_callable())
@@ -243,10 +244,10 @@ struct StoreArgs {
 }
 
 /// Hashes a cache key before entering the mutation-aware table probe.
+///
+/// CPython hashes cache keys with `PyObject_Hash`, so unlike a dict key's hash error, a cache key's is not wrapped.
 fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
-    key.py_hash(vm)?
-        .map(HashValue::raw)
-        .ok_or_else(|| ExcType::type_error_unhashable_dict_key(&key.py_type_name(vm)))
+    plain_hash(key, vm).map(HashValue::raw)
 }
 
 /// Stores a successful frozen call's result. Consumes the key; borrows the wrapper and value.
@@ -349,29 +350,13 @@ fn make_key(positional: &[Value], keywords: &[(Value, Value)], typed: bool, vm: 
     }
 
     // CPython hashes the key eagerly (that is what `_HashedSeq` is for), so an
-    // unhashable argument is reported as itself; leaving it to the lookup would
-    // blame the key tuple built around it instead.
+    // unhashable argument is reported as `hash()` reports the key tuple: by the
+    // innermost unhashable type, not as a dict key.
     let key = allocate_tuple(items, vm.heap);
     let mut key_guard = DropGuard::new(key, vm);
     let (key, vm) = key_guard.as_parts_mut();
-    if key.py_hash(vm)?.is_none() {
-        return Err(unhashable_argument_error(positional, keywords, vm));
-    }
+    plain_hash(key, vm)?;
     Ok(key_guard.into_inner())
-}
-
-/// Names the argument that made the key unhashable.
-///
-/// Falls back to the whole key's type if every argument hashes on its own,
-/// which nothing currently produces.
-#[cold]
-fn unhashable_argument_error(positional: &[Value], keywords: &[(Value, Value)], vm: &mut VM<'_>) -> RunError {
-    for value in positional.iter().chain(keywords.iter().map(|(_, value)| value)) {
-        if matches!(value.py_hash(vm), Ok(None)) {
-            return ExcType::type_error_unhashable(&value.py_type_name(vm));
-        }
-    }
-    ExcType::type_error_unhashable("tuple")
 }
 
 impl HeapItem for LruCache {
@@ -481,7 +466,7 @@ impl<'h> HeapObjectRead<'h, LruCache> {
             ],
             items,
         );
-        Value::Ref(vm.heap.allocate(HeapData::NamedTuple(Box::new(info))))
+        Value::allocate(info, vm.heap)
     }
 
     /// Empties the cache and resets the hit/miss counters, as CPython does.
@@ -507,7 +492,7 @@ impl<'h> HeapObjectRead<'h, LruCache> {
             ),
         ];
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
+        Ok(Value::allocate(dict, vm.heap))
     }
 }
 
