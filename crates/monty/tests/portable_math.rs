@@ -2,8 +2,8 @@
 //!
 //! Rust's float methods call the C library of the target, whose results differ between glibc,
 //! the Windows UCRT and Apple's libm in the last place for a few percent of inputs. The
-//! interpreter instead calls the `libm` crate (see `portable_math.rs` in the crate source), so each
-//! result here must equal the result of calling `libm` directly, bit for bit. Inputs come from
+//! interpreter instead calls the `libm` crate, and `metallic` for `exp` (see `portable_math.rs` in the
+//! crate source), so each result here must equal the result of calling that crate directly, bit for bit. Inputs come from
 //! a fixed pseudo-random sequence over each function's domain, because a handful of
 //! hand-picked inputs showed no platform difference when 5,000 random ones showed about 6 percent.
 
@@ -47,7 +47,7 @@ impl Sequence {
 /// One two-or-three-argument case: label, script, input columns, expected results.
 type Case<'a> = (&'a str, &'a str, Vec<&'a [f64]>, Vec<f64>);
 
-/// A function of one argument: its Python name, the `libm` function it must match, and a
+/// A function of one argument: its Python name, the library function it must match, and a
 /// generator of inputs inside its domain.
 struct Unary {
     name: &'static str,
@@ -144,7 +144,7 @@ const UNARY: &[Unary] = &[
     },
     Unary {
         name: "exp",
-        reference: libm::exp,
+        reference: metallic::exp,
         input: exponent_range,
     },
     Unary {
@@ -221,7 +221,7 @@ fn mismatches(label: &str, inputs: &[Vec<f64>], got: &[f64], expected: &[f64]) -
         .map(|&index| {
             let arguments: Vec<String> = inputs.iter().map(|column| format!("{:e}", column[index])).collect();
             format!(
-                "({}) gave {:#018x} but libm gives {:#018x}",
+                "({}) gave {:#018x}, expected {:#018x}",
                 arguments.join(", "),
                 got[index].to_bits(),
                 expected[index].to_bits()
@@ -237,7 +237,7 @@ fn mismatches(label: &str, inputs: &[Vec<f64>], got: &[f64], expected: &[f64]) -
 }
 
 #[test]
-fn one_argument_math_functions_equal_libm_bit_for_bit() {
+fn one_argument_math_functions_equal_their_library_bit_for_bit() {
     let mut failures = Vec::new();
     for function in UNARY {
         let mut sequence = Sequence(0x9E37_79B9_7F4A_7C15);
@@ -403,7 +403,7 @@ const GOLDEN_BITS: &[u64] = &[
     0x3fea_2fde_d866_1cdd,
     0x4001_5730_b2e8_6bc6,
     0x3f87_ed1e_65f1_3383,
-    0x4000_bed6_24c8_d71d,
+    0x4000_bed6_24c8_d71c,
     0x3fd4_8608_2597_7e8c,
     0x3fe3_6416_195c_dec5,
     0x3fe1_cc3a_19ce_d2d6,
@@ -425,4 +425,25 @@ fn seeded_random_and_complex_powers_have_the_same_bits_on_every_platform() {
         .collect();
     let listing: Vec<String> = got.iter().map(|bits| format!("{bits:#018x}")).collect();
     assert_eq!(got, GOLDEN_BITS, "actual bits:\n{}", listing.join(",\n"));
+}
+
+/// `exp` is also held to the right answer, not only to a crate: `libm` is one unit high at 1, which failed
+/// `math.exp(1) == math.e`, and a crate tried as its replacement was five times off near -709. The expected
+/// bits are the correctly rounded values, worked out with 60-digit decimal arithmetic.
+#[test]
+fn exp_is_correctly_rounded_where_other_libraries_were_not() {
+    let cases: [(f64, u64); 6] = [
+        (1.0, 0x4005_bf0a_8b14_5769),
+        (-709.733_339_354_279_7, 0x0004_33d3_d24d_aaae),
+        (-708.697_238_222_145_9, 0x000b_d7e7_ba9a_1d4f),
+        (0.5, 0x3ffa_6129_8e1e_069c),
+        (-0.5, 0x3fe3_68b2_fc6f_960a),
+        (10.0, 0x40d5_829d_cf95_0560),
+    ];
+    let inputs: Vec<f64> = cases.iter().map(|&(x, _)| x).collect();
+    let got = run_floats("import math\n[math.exp(x) for x in xs]", &[&inputs]);
+    let expected: Vec<f64> = cases.iter().map(|&(_, bits)| f64::from_bits(bits)).collect();
+    assert_eq!(mismatches("math.exp", &[inputs], &got, &expected), None);
+    let constant = run_floats("import math\n[math.exp(1), math.e]", &[]);
+    assert_eq!(constant[0].to_bits(), constant[1].to_bits(), "math.exp(1) == math.e");
 }

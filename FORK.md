@@ -15,17 +15,35 @@ inputs showed no difference at all, so the tests here use thousands of generated
 Branch `deterministic-math`, based on tag `v1.6.0`.
 
 - `crates/monty/src/portable_math.rs` (new): one function per platform-dependent operation, each forwarding to the pure Rust
-  `libm` crate (`sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh exp exp2 exp_m1 ln ln_1p log2 log10 powf
-  cbrt hypot mul_add`). `mul_add` is `libm::fma`, which is exact on every target.
+  `libm` crate (`sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh exp2 exp_m1 ln ln_1p log2 log10 powf
+  cbrt hypot mul_add`), except `exp`, which is `metallic`'s (see "`exp` comes from `metallic`" below). `mul_add` is
+  `libm::fma`, which is exact on every target.
 - Every call site in `math`, `random`, complex numbers, `**` on floats and the f-string digit count now calls it.
 - `clippy.toml` bans the 25 platform methods (`disallowed-methods`), so a new call site cannot reintroduce the platform. Two
   sites outside the sandbox (a duration printer in `monty-runtime`, telemetry JSON in `monty-pool`) are exact integer
   arithmetic and carry a reason.
 - `crates/monty/tests/portable_math.rs` (new): every one-argument `math` function, `log` with and without a base,
-  `pow`, `**`, `atan2`, `hypot`, `fma` compared bit for bit with `libm` over 6,000 generated inputs each, plus a golden test of
-  seeded `random` distributions and complex powers.
+  `pow`, `**`, `atan2`, `hypot`, `fma` compared bit for bit with the crate behind them over 6,000 generated inputs each,
+  correctly rounded values of `exp` at points where a library was wrong, and a golden test of seeded `random`
+  distributions and complex powers.
 
 A third change, a deterministic memory limit, is described under "Third change" below.
+
+### `exp` comes from `metallic` (2026-11-27)
+
+`libm::exp(1.0)` is one unit in the last place above `math.e`, which CPython does not do and upstream's
+`test_cases/math__module.py` asserts. Measured on 2026-11-26 against 200-bit reference values:
+
+- `metallic` 0.3.2 (MIT, pure Rust): no misrounded result in 460,000 inputs, no wrong edge case in 3,638, identical bits
+  on Windows and Linux, with and without the CPU's fused multiply-add.
+- `pxfm` 0.1.30: **do not use it.** Its `exp` is up to five times off near -709 and its two CPU paths differ.
+- `metallic` is slower (`exp` 57 ns a call against 5), and young (one author, much of it written with an AI), so it
+  serves `exp` alone. Using it everywhere would bring the share of results differing from CPython on Linux from 8.57 to
+  4.53 percent; `exp` alone brings it to 8.15.
+
+It is pinned exactly (`=0.3.2`). Taking it changed the last bit of one pinned value, `random.gammavariate(2.5, 1.0)`
+with seed 12345; any seeded distribution or complex power that calls `exp` can differ in its last digits from before.
+Its results on wasm32 and on 32-bit targets have not been compared.
 
 ## Second change: a deterministic step budget (phases 0 to 3 of the plan)
 
@@ -292,11 +310,10 @@ still used wire protocol 9, so ours stays 11. What the merge needed and showed:
   case: sorting strings short enough to live inside the value now takes about 1 step an item instead of about 17. Upstream's
   `Value::as_str` made them reach the fast sort that numbers always took, whose comparisons were never charged. Nothing we
   charge was removed; the sort is also faster (70 ms to 44 ms for 300,000).
-- **One upstream test case fails on this fork, and has since the first change:** `test_cases/math__module.py` asserts
-  `math.exp(1) == math.e`, and `libm::exp(1.0)` is one unit in the last place above `math.e`. It was not seen because
-  `monty-datatest` had not been run here (2026-11-26 is its first run; it needs a Python 3.14 library on `PATH`). The test
-  is left as upstream wrote it until it is decided whether to change the function or the assertion. It affects the
-  upstream-facing branch `portable-float-math` in the same way.
+- One upstream test case, `test_cases/math__module.py` (`math.exp(1) == math.e`), had failed since the first change,
+  unseen because `monty-datatest` had not been run here (2026-11-26 was its first run; it needs a Python 3.14 library on
+  `PATH`). Fixed on 2026-11-27 by taking `exp` from `metallic`. **The upstream-facing branch `portable-float-math` still
+  has the failure.** Run `monty-datatest` after every merge: `cargo test` does not.
 - The same run fails `complex__all.py` and `time__struct_time.py` in their CPython half (CPython 3.14.10 on Windows), which
   runs no code of this fork.
 
@@ -309,10 +326,10 @@ still used wire protocol 9, so ours stays 11. What the merge needed and showed:
 
 ## Things to know
 
-- The results are those of the `libm` version in `Cargo.lock`. The crate is not always the closest-rounded answer: it differs
-  from the platform libraries in the last place on many inputs (for example `atanh` on about 39 percent of random inputs against
-  the Windows UCRT). That is the price of one answer everywhere. A `libm` upgrade can change last digits, so the embedding
-  project should pin it.
+- The results are those of the `libm` version in `Cargo.lock` and of `metallic` 0.3.2. `libm` is not always the
+  closest-rounded answer: it differs from the platform libraries in the last place on many inputs (for example `atanh` on
+  about 39 percent of random inputs against the Windows UCRT). That is the price of one answer everywhere. A `libm`
+  upgrade can change last digits, so the embedding project should pin it (`metallic` is pinned here).
 - Where CPython prints a different last digit than this fork for `math.sin(x)`, this fork is the one that is the same
   everywhere.
 - To update: fetch upstream, check out the new release tag as a new branch, re-apply with `git cherry-pick` of the commits of

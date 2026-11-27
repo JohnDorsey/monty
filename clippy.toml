@@ -1,7 +1,7 @@
 absolute-paths-max-segments = 2
 
 # Float maths must not reach the platform's C library: results differ between glibc, the Windows UCRT and
-# Apple's libm in the last place. Use `crate::portable_math` (a pure Rust `libm`) instead.
+# Apple's libm in the last place. Use `crate::portable_math` (pure Rust implementations) instead.
 disallowed-methods = [
     { path = "f64::sin", reason = "platform-dependent last digit; use crate::portable_math" },
     { path = "f64::cos", reason = "platform-dependent last digit; use crate::portable_math" },
