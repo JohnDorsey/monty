@@ -1414,6 +1414,17 @@ impl Value {
         }
     }
 
+    /// True when this is a `LongInt`-valued int (interned or heap-allocated) that is negative, so that a
+    /// fixed-width consumer can tell a negative answer from one too large to hold. False for every other
+    /// value, `Int` and `Bool` included.
+    pub(crate) fn long_int_is_negative(&self, vm: &VM<'_>) -> bool {
+        match self {
+            Self::InternLongInt(id) => vm.interns.get_long_int(*id).sign() == Sign::Minus,
+            Self::Ref(id) => matches!(vm.heap.get(*id), HeapData::LongInt(li) if li.inner().sign() == Sign::Minus),
+            _ => false,
+        }
+    }
+
     /// [`Self::as_int`] with a caller-chosen overflow error.
     ///
     /// The width a value must fit is a property of the *consumer*, not of the

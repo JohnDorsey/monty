@@ -141,11 +141,10 @@ Each links to the page that owns it, which is where the full account lives:
     ([iter.md](iter.md)).
 - **`re` is backed by Rust's `fancy-regex`**, not CPython's engine: no `bytes` patterns, and some error messages
     differ ([re.md](re.md)).
-- **Only the class dunders listed above are dispatched.** `__lt__` and `__len__` raise
+- **Only the class dunders listed above are dispatched.** `__lt__` raises
     `TypeError` as if undefined, while in-place arithmetic dunders are skipped in favor of binary arithmetic
     (`@=` is rejected at compile time).
-    The `__getattr__` family is ignored silently, as is `__len__` in a truth test, so an instance
-    without `__bool__` is truthy
+    The `__getattr__` family is ignored silently, and `__len__` serves `len()` and truth tests only
     ([classes.md](classes.md)).
 - **There is no event loop inside the sandbox.** `async` / `await` work, and `asyncio` exposes `run`, `gather`,
     `create_task`, `wait`, `sleep`, `Task`, `InvalidStateError` and the three `wait` constants; everything else

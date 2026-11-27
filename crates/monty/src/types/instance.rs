@@ -252,8 +252,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
         call_int_dunder(self.id(), "__int__", vm)
     }
 
-    /// CPython's truth test: `__bool__` if the class has one, which must answer a real `bool`. Without it an
-    /// instance is true; `__len__` is not consulted.
+    /// CPython's truth test: `__bool__` if the class has one, which must answer a real `bool`; else false
+    /// for a `__len__` of zero; else true.
     fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
         let class_id = self.get(vm.heap).class();
         if matches!(class_dunder(class_id, "__bool__", vm), Some(Value::None)) {
@@ -266,7 +266,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
                 Err(ExcType::type_error_non_bool_return(&result.py_type_name(vm)))
             }
         } else {
-            Ok(true)
+            Ok(instance_len(self.id(), vm)? != Some(0))
         }
     }
 
@@ -847,6 +847,23 @@ pub(crate) fn instance_call_dunder_sync(
 ) -> RunResult<Option<Value>> {
     let args = arg.map_or(ArgValues::Empty, ArgValues::One);
     call_dunder_args_sync(self_id, dunder, args, vm)
+}
+
+/// The class's `__len__`, validated as CPython does, or `None` if it defines none.
+pub(crate) fn instance_len(self_id: HeapId, vm: &mut VM<'_>) -> RunResult<Option<i64>> {
+    let Some(result) = instance_call_dunder_sync(self_id, "__len__", None, vm)? else {
+        return Ok(None);
+    };
+    defer_drop!(result, vm);
+    let index = result.py_index(vm)?;
+    defer_drop!(index, vm);
+    if matches!(index, Value::Int(n) if *n < 0) || index.long_int_is_negative(vm) {
+        Err(ExcType::value_error_negative_len())
+    } else {
+        index
+            .as_int_with_overflow(vm, || ExcType::overflow_index_sized_int().into())
+            .map(Some)
+    }
 }
 
 /// Validates integer conversion results, normalizing the permitted bool subclass.

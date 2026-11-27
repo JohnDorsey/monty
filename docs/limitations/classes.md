@@ -37,7 +37,7 @@ and function-attributes-become-methods), bound methods, class variables
 (arbitrary expressions, evaluated in a real suspendable class-body scope),
 **class decorators** (`@deco class Foo`),
 `__repr__`/`__str__`/`__enter__`/`__exit__`/`__eq__`/`__hash__` dispatch,
-`__call__`, `__getitem__`/`__setitem__`, unary `+`/`-`, and binary numeric operators
+`__call__`, `__getitem__`/`__setitem__`, `__bool__`/`__len__`, unary `+`/`-`, and binary numeric operators
 (including `@`, `divmod()` and `pow()`) with their reflected forms,
 `obj.__class__`, `Foo.__name__`, `Foo.__doc__`/`obj.__doc__`,
 `Foo.__annotations__` (evaluated lazily, see [typing.md](typing.md#annotations)),
@@ -138,8 +138,7 @@ order and error wording, but with these divergences:
     An external or OS call raises `NotImplementedError` rather than yielding to the host.
     `__call__` uses the ordinary suspendable call path.
 - **Ordering dunders are still not dispatched**; see the entry above.
-    Truth testing dispatches `__bool__`, which cannot suspend either. `__len__` is not dispatched, so an instance
-    without `__bool__` is true even when its class defines `__len__`, where CPython would ask it.
+    Truth testing dispatches `__bool__` and then `__len__`, which cannot suspend either.
 - **Bound methods compare and hash by identity**: each `obj.method` access
     creates a fresh object, so `obj.method == obj.method` is `False` and two
     accesses hash differently. CPython compares/hashes bound methods by
@@ -454,7 +453,7 @@ every construction request. Divergences:
     Every decorator in a stack reports that same location; only the callee frame
     identifies which one raised.
 - Dunder protocols not dispatched for user-defined instances include `__new__`, `__ne__`, ordering comparisons,
-    `__len__`, `__complex__`, `__format__`, and all in-place arithmetic dunders (`__iadd__`, etc.).
+    `__complex__`, `__format__`, and all in-place arithmetic dunders (`__iadd__`, etc.).
     Augmented assignment falls back to binary arithmetic rather than calling an in-place dunder,
     except `@=`, which is rejected at compile time.
     `__ne__` is always the negation of `__eq__`, so a custom `__ne__` is ignored.
@@ -495,9 +494,10 @@ every construction request. Divergences:
     a `StopIteration` raised anywhere inside it ends the iteration, including one
     that propagates out of a nested call, where CPython's PEP 479 protections
     apply only to generators, which Monty does not have.
-- **A `__contains__` returning a user instance asks its `__bool__` only.** CPython's
-    `PyObject_IsTrue` falls back to the returned object's `__len__`, which Monty does not
-    dispatch (see above). Every other return type coerces as CPython does.
+- **`__len__` is asked by `len()` and by truth tests only.** `random.choice` and `random.shuffle` raise
+    `TypeError: object of type 'Foo' has no len()` for a user instance, where CPython asks its `__len__` (and
+    `__getitem__`). CPython's `list(x)` and similar constructors also call `__len__` as a size hint, so a
+    `__len__` that raises or counts its calls is seen there; Monty does not call it.
 - Attribute-access hooks are **never** dispatched: `__getattr__`,
     `__getattribute__`, `__setattr__`, `__delattr__`, and `__del__`. A missing
     attribute always raises the default `AttributeError` even when the class

@@ -1484,6 +1484,12 @@ pub(crate) trait ExcTypeExt: Sized {
         Self::type_error(format!("{dunder} returned non-int (type {type_})"))
     }
 
+    /// `__len__` answered below zero.
+    #[must_use]
+    fn value_error_negative_len() -> RunError {
+        Self::value_error("__len__() should return >= 0")
+    }
+
     /// A class that set `__bool__ = None` refuses to be truth tested.
     #[must_use]
     fn type_error_not_boolean(type_name: &str) -> RunError {

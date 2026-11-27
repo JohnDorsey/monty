@@ -243,17 +243,22 @@ points, independence from the process, overshoot, garbage, shrinking in place, r
 round trip, the worker dispatch (the same message in three workers; a restored session keeps and tightens it), two real
 worker processes behind `monty-pool`, and the Python and JavaScript limits tests.
 
-## Fourth change: `__bool__` on user classes (2026-11-26)
+## Fourth change: `__bool__` (2026-11-26) and `__len__` (2026-11-27) on user classes
 
 Upstream dispatches no truth hook, so every instance is true. This fork calls `__bool__` with CPython's rules: it must
 return a real `bool`, `__bool__ = None` refuses the truth test, and the class (not the instance) is asked. The behaviour
 and both error messages follow upstream's open pull request 1086 (not merged on 2026-11-26), so that taking it later
-replaces our method and little else. That request also adds `__len__`, which this fork does **not**: a class with only
-`__len__` is still true, where CPython would say false for a length of 0.
+replaces our method and little else.
 
-The work inside `__bool__` counts against the step budget, it cannot call the host (it runs synchronously, like
-`__eq__`), and one that tests itself raises `RecursionError`. Tests: `test_cases/class__bool.py` (runs on CPython and on
-Monty) and `tests/bool_dunder.rs`.
+`__len__` is a narrow version of the same request's: `len()` and truth tests ask it (after `__bool__`), with CPython's
+checks (`__index__` accepted, negative and oversized answers refused). The request also makes every other consumer of a
+length ask the class, which here would have meant changing `py_len` for every type. So `random.choice` and
+`random.shuffle` still refuse a user instance, and `list(x)` does not call `__len__` as a size hint
+(`docs/limitations/classes.md`). `instance_len` in `types/instance.rs` is the one place; drop it when upstream's lands.
+
+The work inside either counts against the step budget, neither can call the host (they run synchronously, like
+`__eq__`), and one that asks itself raises `RecursionError`. Tests: `test_cases/class__bool.py` and `class__len.py` (run
+on CPython and on Monty), `tests/bool_dunder.rs` and `tests/len_dunder.rs`.
 
 Verification on Windows after the merge and this change: `monty`, `monty-types` and `monty-runtime` 1,624 tests,
 `monty-proto` 171, `monty-pool` 221, none failing; clippy (past the known `monty-fs` lint) and rustfmt clean; the Python
@@ -261,6 +266,13 @@ and wasm binding crates compile, but the Python and JavaScript test suites were 
 passed and the 3 known failed, with and without `memory-model-checks`. Under that feature `monty`'s own tests have one
 failure, `the_overshoot_is_small_when_the_heap_is_big`: the slow build meets the test's time limit before its memory
 limit, as it did before this change.
+
+On 2026-11-27, with `exp` from `metallic` and `__len__`: Windows `monty`, `monty-types` and `monty-runtime` 1,631 tests,
+`monty-proto` 171, `monty-pool` 221, none failing; `monty-datatest` 1,632 passed with and without `memory-model-checks`,
+only `complex__all.py` and `time__struct_time.py` failing (their CPython half); the same one failure under that feature
+as above. Linux (WSL): the first three crates 1,660 passed and the 3 known compile-fail snapshots failed. The `exp`
+tests also pass on both with `-C target-feature=+fma`. The Python, wasm and JavaScript binding crates compile; their own
+test suites were not run.
 
 ## Verification status (2026-11-16)
 

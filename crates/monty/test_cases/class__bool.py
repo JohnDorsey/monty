@@ -1,5 +1,5 @@
-# `__bool__` on user classes. Runs on Monty and CPython, so nothing here depends on `__len__`, which Monty
-# does not dispatch on user classes.
+# `__bool__` on user classes. Runs on Monty and CPython. `__len__`, which a truth test asks after
+# `__bool__`, is in `class__len.py`.
 
 
 class Truth:
