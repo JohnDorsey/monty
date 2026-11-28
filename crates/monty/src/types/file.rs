@@ -25,13 +25,11 @@
 //!
 //! # Iteration
 //!
-//! `__next__` slices the next line from the loaded buffer and cannot yield to
-//! the host, so only the `ForIter` opcode and `next()` load an unread file:
-//! [`needs_buffer_load`] then [`buffer_load_call`] with a `BufferLoad`
-//! (re-dispatch) or `FileNext` (answer the call) effect. Any other caller of
-//! `py_next` on an unread file raises `NotImplementedError`.
+//! Suspendable advancement loads an unread file through [`buffer_load_call`]
+//! with a `FileNext` effect, then returns the first line. This applies to
+//! `next()`, loops and lazy `map`/`filter` consumers. For synchronous consumers,
+//! [`PyValue::next_sync`](crate::py_value::PyValue::next_sync) rejects an unread file with `NotImplementedError`.
 //!
-//! [`needs_buffer_load`]: HeapObjectRead::needs_buffer_load
 //! [`buffer_load_call`]: HeapObjectRead::buffer_load_call
 //!
 //! A buffered read that *fails* in the host leaves the file in a retry-safe
@@ -66,8 +64,7 @@
 //!   cookie. Round-trips through `seek()` correctly.
 //! - `seek(N)` in text mode accepts any char-index offset, where CPython
 //!   restricts it to `seek(0)`, `seek(0, 2)`, or a cookie from `tell()`.
-//! - Iterating an unread file works from `for` loops and `next()` only; a
-//!   builtin consuming it synchronously (`list(f)`, `enumerate(f)`) raises
+//! - Iterating an unread file through a synchronous consumer (`list(f)`, `enumerate(f)`) raises
 //!   `NotImplementedError` until a read or `seek()` has loaded the buffer.
 //!
 //! Any code path that needs one of these should be added explicitly
@@ -78,6 +75,7 @@ use std::{
     mem,
 };
 
+use monty_macros::pyattrs;
 use monty_types::{
     MontyObject, MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs, WriteBytesAtArgs,
     unstable::MontyNode,
@@ -86,6 +84,7 @@ use monty_types::{
 use super::{
     LazyHeapSet, List, PyTrait, Type, TypeRef,
     bytes::{Bytes, bytes_repr_fmt},
+    io::{Newline, translate_newlines},
     str::{allocate_string, allocate_string_on_heap},
 };
 use crate::{
@@ -93,9 +92,10 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadMut, HeapReadOutput},
+    heap::{DropGuard, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadMut, HeapReadOutput},
     intern::StaticStrings,
     os_dispatch::{PostConversionEffect, stat_result_field},
+    py_attrs::PyAttrs,
     py_value::PyValue,
     types::str::StringRepr,
     value::{EitherStr, Value},
@@ -114,7 +114,7 @@ impl FileName {
     fn to_value(&self, heap: &Heap) -> Value {
         match self {
             Self::Str(name) => allocate_string(name.as_str(), heap),
-            Self::Bytes(name) => Value::Ref(heap.allocate(HeapData::Bytes(Bytes::new(name.clone())))),
+            Self::Bytes(name) => Value::allocate(Bytes::new(name.clone()), heap),
         }
     }
 }
@@ -156,76 +156,6 @@ pub(crate) enum ReadSpec {
 }
 
 pub use monty_types::FileMode;
-
-/// The `newline` argument to `open()` for text files: where lines end on read,
-/// whether `\r\n` / `\r` are translated to `\n`, and what `\n` becomes on write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Newline {
-    /// `None`: universal newlines translated to `\n` on read; `\n` written as is,
-    /// since the sandbox's `os.linesep` is `\n` on every host.
-    #[default]
-    Universal,
-    /// `''`: universal line splitting with terminators kept; nothing translated.
-    Passthrough,
-    /// `'\n'`: lines end at `\n` only; nothing translated.
-    Lf,
-    /// `'\r'`: lines end at `\r`; `\n` is written as `\r`.
-    Cr,
-    /// `'\r\n'`: lines end at `\r\n`; `\n` is written as `\r\n`.
-    CrLf,
-}
-
-impl Newline {
-    /// Parses the str form of the argument; `None` for a value CPython rejects.
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "" => Some(Self::Passthrough),
-            "\n" => Some(Self::Lf),
-            "\r" => Some(Self::Cr),
-            "\r\n" => Some(Self::CrLf),
-            _ => None,
-        }
-    }
-
-    /// Whether `\r\n` and `\r` become `\n` when the buffer is installed.
-    fn translates_on_read(self) -> bool {
-        matches!(self, Self::Universal)
-    }
-
-    /// Byte length of the first line of `tail` including its terminator, or all
-    /// of `tail` for an unterminated last line. A `Universal` buffer was
-    /// translated on load, so only `\n` is left to find.
-    fn line_len(self, tail: &str) -> usize {
-        match self {
-            Self::Universal | Self::Lf => tail.find('\n').map_or(tail.len(), |i| i + 1),
-            Self::Cr => tail.find('\r').map_or(tail.len(), |i| i + 1),
-            Self::CrLf => tail.find("\r\n").map_or(tail.len(), |i| i + 2),
-            Self::Passthrough => match tail.find(['\r', '\n']) {
-                Some(i) if tail[i..].starts_with("\r\n") => i + 2,
-                Some(i) => i + 1,
-                None => tail.len(),
-            },
-        }
-    }
-
-    /// Applies the write-side translation: `\n` becomes `\r` or `\r\n` for
-    /// those modes, every other mode writes `text` as passed. Also returns the
-    /// original char count when the payload changed, since `write()` reports
-    /// the length of the text it was given rather than what reached the file.
-    fn translate_write(self, text: String) -> (String, Option<usize>) {
-        let replacement = match self {
-            Self::Cr => "\r",
-            Self::CrLf => "\r\n",
-            Self::Universal | Self::Passthrough | Self::Lf => return (text, None),
-        };
-        if text.contains('\n') {
-            let chars = text.chars().count();
-            (text.replace('\n', replacement), Some(chars))
-        } else {
-            (text, None)
-        }
-    }
-}
 
 /// Crate-internal extension mapping a [`FileMode`] to the runtime `_io`
 /// wrapper [`Type`] (`FileMode` lives in `monty-types`, `Type` does not).
@@ -468,17 +398,21 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, OpenFile> {
         Ok(CallResult::Value(self.clone_value(vm.heap)))
     }
 
-    /// The next line of the loaded buffer. An unread file cannot be loaded from
-    /// here (see the module docs): `for` and `next()` load it before calling this.
-    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
         let file = self.get(vm.heap);
         file.ensure_open()?;
         if !file.mode.readable() {
-            Err(unsupported_operation("not readable"))
+            Err(ExcType::unsupported_operation("not readable"))
         } else if file.buffer.is_none() {
-            Err(unloaded_iteration_error(file.file_type()))
+            Ok(Some(self.buffer_load_call(
+                vm,
+                PostConversionEffect::FileNext {
+                    file_id: self.id(),
+                    default: None,
+                },
+            )))
         } else {
-            next_line(self, vm)
+            Ok(next_line(self, vm)?.map(CallResult::Value))
         }
     }
 
@@ -492,37 +426,6 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, OpenFile> {
         }
         write!(f, " mode={}>", StringRepr(file.mode()))?;
         Ok(())
-    }
-
-    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
-        let Some(method) = attr.static_string(vm.interns) else {
-            args.drop_with(vm);
-            return Err(ExcType::attribute_error(
-                self.py_type(vm).name(vm.heap, vm.interns),
-                attr.as_str(vm.interns),
-            ));
-        };
-
-        match method {
-            StaticStrings::Read => self.read(vm, args),
-            StaticStrings::Readline => self.readline(vm, args),
-            StaticStrings::Readlines => self.readlines(vm, args),
-            StaticStrings::Tell => self.tell(vm, args),
-            StaticStrings::Seek => self.seek(vm, args),
-            StaticStrings::Write => self.write(vm, args),
-            StaticStrings::Close => self.close(vm, args),
-            StaticStrings::Flush => self.flush(vm, args),
-            StaticStrings::Readable => self.readable(vm, args),
-            StaticStrings::Writable => self.writable(vm, args),
-            StaticStrings::Seekable => self.seekable(vm, args),
-            _ => {
-                args.drop_with(vm);
-                Err(ExcType::attribute_error(
-                    self.py_type(vm).name(vm.heap, vm.interns),
-                    attr.as_str(vm.interns),
-                ))
-            }
-        }
     }
 
     fn py_is_context_manager(&self, _vm: &VM<'h>) -> bool {
@@ -597,7 +500,7 @@ impl<'h> HeapObjectRead<'h, OpenFile> {
                 let file = self.get(vm.heap);
                 file.ensure_open()?;
                 if !file.mode.readable() {
-                    return Err(unsupported_operation("not readable"));
+                    return Err(ExcType::unsupported_operation("not readable"));
                 }
                 file.mode.is_binary()
             };
@@ -735,7 +638,7 @@ impl<'h> HeapObjectRead<'h, OpenFile> {
         if file.mode.readable() {
             Ok(())
         } else {
-            Err(unsupported_operation("not readable"))
+            Err(ExcType::unsupported_operation("not readable"))
         }
     }
 
@@ -819,7 +722,7 @@ impl<'h> HeapObjectRead<'h, OpenFile> {
             Ok(())
         } else {
             let message = if file.mode.is_binary() { "write" } else { "not writable" };
-            Err(unsupported_operation(message))
+            Err(ExcType::unsupported_operation(message))
         }
     }
 
@@ -1045,8 +948,7 @@ pub(crate) fn apply_open_name(
 ) -> RunResult<Value> {
     let parsed = newline.as_deref().map_or(Some(Newline::default()), Newline::parse);
     if let Some(parsed) = parsed
-        && let Value::Ref(id) = &value
-        && let HeapReadOutput::OpenFile(file) = vm.heap.read(*id)
+        && let Some(file) = value.read_as::<OpenFile>(vm.heap)
     {
         let file = file.get_mut(vm.heap);
         if !file.path.is_empty() && !file.path.starts_with('/') {
@@ -1112,9 +1014,8 @@ pub(crate) fn apply_buffer_store(file_id: HeapId, result: Value, vm: &mut VM<'_>
     compute_slice(&file, spec, vm)
 }
 
-/// `BufferLoad` resume: installs the host content so the `ForIter` that
-/// found the file unread can re-dispatch against the buffer. Produces no
-/// value; the pin on `file_id` is released here.
+/// Installs host content before replaying a consumer that required a loaded file.
+/// Consumes the pin on `file_id` and the host's result.
 pub(crate) fn apply_buffer_load(file_id: HeapId, result: Value, vm: &mut VM<'_>) -> RunResult<()> {
     let pin = Value::Ref(file_id);
     defer_drop!(pin, vm);
@@ -1127,10 +1028,8 @@ pub(crate) fn apply_buffer_load(file_id: HeapId, result: Value, vm: &mut VM<'_>)
     install_buffer(&file, result, vm)
 }
 
-/// `FileNext` resume: installs the host content, then answers the
-/// `next(file, default)` that triggered the load — the first line, `default`
-/// for an empty file, or `StopIteration`. Releases the pin on `file_id` and
-/// whichever of `default` / the line is not returned.
+/// Installs the host content, then returns the first line or raises `StopIteration`.
+/// A frozen caller handles exhaustion when the original operation supplied a default.
 pub(crate) fn apply_file_next(
     file_id: HeapId,
     default: Option<Value>,
@@ -1176,7 +1075,7 @@ fn install_buffer<'h>(file: &HeapReadMut<'h, OpenFile>, result: Value, vm: &mut 
         }
         Value::InternBytes(bytes_id) => {
             let bytes = vm.interns.get_bytes(*bytes_id).to_vec();
-            Some(Value::Ref(vm.heap.allocate(HeapData::Bytes(Bytes::new(bytes)))))
+            Some(Value::allocate(Bytes::new(bytes), vm.heap))
         }
         Value::Ref(id) => match vm.heap.get(*id) {
             HeapData::Str(text) if translate && text.as_str().contains('\r') => {
@@ -1209,24 +1108,6 @@ fn install_buffer<'h>(file: &HeapReadMut<'h, OpenFile>, result: Value, vm: &mut 
     populate_buffer_meta(file, vm)
 }
 
-/// Rewrites `\r\n` and lone `\r` to `\n` in one pass: universal newlines on
-/// read. The output is never longer than the input, so a plain `String` is fine.
-fn translate_newlines(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            out.push('\n');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// The next line of a loaded buffer for the iterator protocol: `None` at EOF
 /// where `readline()` would return an empty string.
 fn next_line<'h>(file: &HeapReadMut<'h, OpenFile>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -1242,18 +1123,11 @@ fn next_line<'h>(file: &HeapReadMut<'h, OpenFile>, vm: &mut VM<'h>) -> RunResult
     }
 }
 
-/// `__next__` on an unread file from a caller that cannot suspend for the host
-/// read (`list(f)`, `enumerate(f)`, …); only `for` and `next()` issue it.
-///
-/// TODO: `enumerate`, `zip`, `map`, `filter` and `sorted` go away from this
-/// list once they are bytecode, since they then iterate through `ForIter`
-/// (<https://github.com/pydantic/monty/issues/1041>).
-/// The Rust-side consumers that remain (`list(f)`, `''.join(f)`, `sum(f)`, …)
-/// need the `LoadThenCall` effect `csv.reader(f)` uses: yield the load with
-/// the call stashed, replay the call on resume.
-fn unloaded_iteration_error(file_type: Type) -> RunError {
+/// Reports an unread file reached through a synchronous consumer such as `list` or `join`.
+/// Such callers must load the buffer first, or retain their call across the host read.
+pub(crate) fn unloaded_iteration_error(file_type: Type) -> RunError {
     ExcType::not_implemented(format!(
-        "iterating an unread {file_type} is only supported by 'for' loops and next(); call seek(0) first to load it"
+        "iterating an unread {file_type} cannot suspend in this synchronous context; call seek(0) first to load it"
     ))
     .into()
 }
@@ -1480,9 +1354,13 @@ fn compute_slice_text<'h>(
                     items.push(allocate_string(line.to_owned(), vm.heap));
                     start += end;
                 }
-                let list_id = vm.heap.allocate(HeapData::List(List::new(items)));
                 // Past-EOF preservation: matches `ReadSpec::All`.
-                (Value::Ref(list_id), position.max(buffer_total), buffer.len(), true)
+                (
+                    Value::allocate(List::new(items), vm.heap),
+                    position.max(buffer_total),
+                    buffer.len(),
+                    true,
+                )
             }
             ReadSpec::Seek { offset, whence } => {
                 let target = resolve_seek_target_usize(offset, whence, position, buffer_total)?;
@@ -1541,8 +1419,7 @@ fn compute_slice_binary<'h>(
                     vm.heap.inc_ref(buffer_id);
                     Value::Ref(buffer_id)
                 } else {
-                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail.to_vec())));
-                    Value::Ref(id)
+                    Value::allocate(Bytes::new(tail.to_vec()), vm.heap)
                 };
                 // Preserve `position` if it was already past `buffer_total`
                 // (set there by `seek()`) — CPython's read-at-EOF leaves the
@@ -1551,20 +1428,26 @@ fn compute_slice_binary<'h>(
             }
             ReadSpec::Size(n) => {
                 let take = tail.len().min(n);
-                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..take].to_vec())));
                 // Advance from the un-clamped user position so a past-EOF
                 // `read(N)` (which yields no bytes) leaves `position` alone
                 // instead of snapping it back to `buffer_total`.
                 let new_pos = position + take;
-                (Value::Ref(id), new_pos, new_pos >= buffer_total)
+                (
+                    Value::allocate(Bytes::new(tail[..take].to_vec()), vm.heap),
+                    new_pos,
+                    new_pos >= buffer_total,
+                )
             }
             ReadSpec::Line => {
                 let end = tail.iter().position(|b| *b == b'\n').map_or(tail.len(), |i| i + 1);
-                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..end].to_vec())));
                 // See `Size` above — past-EOF `readline()` returns `b''`
                 // without rewinding `position`.
                 let new_pos = position + end;
-                (Value::Ref(id), new_pos, new_pos >= buffer_total)
+                (
+                    Value::allocate(Bytes::new(tail[..end].to_vec()), vm.heap),
+                    new_pos,
+                    new_pos >= buffer_total,
+                )
             }
             ReadSpec::Lines => {
                 let mut items: Vec<Value> = Vec::new();
@@ -1572,13 +1455,15 @@ fn compute_slice_binary<'h>(
                 while start < tail.len() {
                     let rest = &tail[start..];
                     let end = rest.iter().position(|b| *b == b'\n').map_or(rest.len(), |i| i + 1);
-                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(rest[..end].to_vec())));
-                    items.push(Value::Ref(id));
+                    items.push(Value::allocate(Bytes::new(rest[..end].to_vec()), vm.heap));
                     start += end;
                 }
-                let list_id = vm.heap.allocate(HeapData::List(List::new(items)));
                 // Past-EOF preservation: matches `ReadSpec::All`.
-                (Value::Ref(list_id), position.max(buffer_total), true)
+                (
+                    Value::allocate(List::new(items), vm.heap),
+                    position.max(buffer_total),
+                    true,
+                )
             }
             ReadSpec::Seek { offset, whence } => {
                 // Seek resolves against the un-clamped position so
@@ -1777,7 +1662,7 @@ fn parse_read_size_arg(size_arg: Option<Value>, vm: &mut VM<'_>) -> RunResult<Re
 /// Text mode reuses the canonical empty string without a heap allocation.
 fn empty_result(binary: bool, vm: &VM<'_>) -> Value {
     if binary {
-        Value::Ref(vm.heap.allocate(HeapData::Bytes(Bytes::new(Vec::new()))))
+        Value::allocate(Bytes::new(Vec::new()), vm.heap)
     } else {
         allocate_string("", vm.heap)
     }
@@ -1832,10 +1717,88 @@ fn is_bytes(data: &Value, heap: &Heap) -> bool {
     }
 }
 
-/// Builds the `io.UnsupportedOperation` used for file operations that the
-/// open mode forbids (e.g. `read()` on `'w'`, `write()` on `'r'`). In CPython
-/// this is a subclass of both `OSError` and `ValueError`; Monty matches both
-/// in `try`/`except` matching through its two bases in the native type table.
-fn unsupported_operation(message: &'static str) -> RunError {
-    SimpleException::new_msg(ExcType::UnsupportedOperation, message).into()
+pub(crate) struct PyFileImpl;
+
+#[pyattrs]
+impl<'heap> PyAttrs<'heap> for PyFileImpl {
+    type Receiver = HeapObjectRead<'heap, OpenFile>;
+
+    #[pymethod(Read)]
+    fn read<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.read(vm, args)
+    }
+
+    #[pymethod(Readline)]
+    fn readline<'h>(
+        this: &mut HeapObjectRead<'h, OpenFile>,
+        args: ArgValues,
+        vm: &mut VM<'h>,
+    ) -> RunResult<CallResult> {
+        this.readline(vm, args)
+    }
+
+    #[pymethod(Readlines)]
+    fn readlines<'h>(
+        this: &mut HeapObjectRead<'h, OpenFile>,
+        args: ArgValues,
+        vm: &mut VM<'h>,
+    ) -> RunResult<CallResult> {
+        this.readlines(vm, args)
+    }
+
+    #[pymethod(Tell)]
+    fn tell<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.tell(vm, args)
+    }
+
+    #[pymethod(Seek)]
+    fn seek<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.seek(vm, args)
+    }
+
+    #[pymethod(Write)]
+    fn write<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.write(vm, args)
+    }
+
+    #[pymethod(Close)]
+    fn close<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.close(vm, args)
+    }
+
+    #[pymethod(Flush)]
+    fn flush<'h>(this: &mut HeapObjectRead<'h, OpenFile>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        this.flush(vm, args)
+    }
+
+    #[pymethod(Readable)]
+    fn readable<'h>(
+        this: &mut HeapObjectRead<'h, OpenFile>,
+        args: ArgValues,
+        vm: &mut VM<'h>,
+    ) -> RunResult<CallResult> {
+        this.readable(vm, args)
+    }
+
+    #[pymethod(Writable)]
+    fn writable<'h>(
+        this: &mut HeapObjectRead<'h, OpenFile>,
+        args: ArgValues,
+        vm: &mut VM<'h>,
+    ) -> RunResult<CallResult> {
+        this.writable(vm, args)
+    }
+
+    #[pymethod(Seekable)]
+    fn seekable<'h>(
+        this: &mut HeapObjectRead<'h, OpenFile>,
+        args: ArgValues,
+        vm: &mut VM<'h>,
+    ) -> RunResult<CallResult> {
+        this.seekable(vm, args)
+    }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/file.rs"]
+mod tests;

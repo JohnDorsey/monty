@@ -51,6 +51,7 @@ from. CPython, where the same object is an ordinary instance, copies it.
 CPython raises the same error for most of these, but not all: it copies
 iterators whose type is picklable, so `copy.deepcopy(iter([1, 2]))` returns a
 fresh iterator in CPython and raises here.
+`map` and `filter` iterators are also rejected here rather than copied.
 
 The type named in the message is Monty's, so it can differ from CPython's name
 for the same object (see [classes.md](classes.md)).
@@ -63,7 +64,9 @@ aliases (`list[int]`) and unions (`int | None`), where CPython builds an equal
 new one through the pickle protocol. `timezone.utc` is the exception, a
 singleton in both, so only other offsets show it. `deepcopy` of a `slice`
 diverges the same way; `copy.copy` of one does not, CPython sharing slices too.
-Nothing in Monty can mutate any of these, so only `is` can tell the difference.
+Nothing in Monty can mutate any of these, so only `is` can tell the difference, with one exception: a
+`StopIteration`'s `.value` can be mutable, and since `copy.deepcopy(e)` is `e`, mutating the copy's `.value` changes the
+original's, where CPython copies it.
 `copy.copy` of a named tuple *does* build a new object, matching CPython.
 
 The cases where sharing is CPython's behaviour too — `str`, `bytes`, `int`,

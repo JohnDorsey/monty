@@ -792,14 +792,27 @@ if is_monty:
     except NotImplementedError as exc:
         assert (
             str(exc)
-            == "iterating an unread _io.TextIOWrapper is only supported by 'for' loops and next(); call seek(0) first to load it"
+            == 'iterating an unread _io.TextIOWrapper cannot suspend in this synchronous context; call seek(0) first to load it'
         )
     f.seek(0)
     assert list(f) == ['first\n', 'second\n', 'third']
     f.close()
-# generator expressions compile to `for` loops, so they can load an unread file
+# Advancing a generator expression with `next()` can suspend to read the file.
 with open(root / 'iter.txt') as f:
-    assert list(line.strip() for line in f) == ['first', 'second', 'third']
+    lines = (line.strip() for line in f)
+    assert next(lines) == 'first'
+    assert list(lines) == ['second', 'third']
+
+# Lazy adaptors can load an unread source when consumed by a comprehension.
+with open(root / 'iter.txt') as f:
+    mapped = map(lambda line: line.strip(), f)
+    assert [line for line in mapped] == ['first', 'second', 'third']
+with open(root / 'iter.txt') as f:
+    filtered = filter(lambda line: line.startswith('s'), f)
+    assert next(filtered) == 'second\n'
+    assert next(filtered, None) is None
+with open(root / 'iter_empty.txt') as f:
+    assert [line for line in map(str, f)] == []
 
 # closed and write-only files
 f = open(root / 'iter.txt')

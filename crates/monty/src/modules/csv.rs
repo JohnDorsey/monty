@@ -18,12 +18,12 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
-    heap::{DropGuard, DropWithContext, HeapData, HeapReadOutput},
+    heap::{DropGuard, DropWithContext},
     intern::StaticStrings,
     modules::ModuleFunctions,
     os_dispatch::PostConversionEffect,
     types::{
-        CsvObject, List, Module, PyTrait, Type,
+        CsvObject, List, Module, OpenFile, PyTrait, Type,
         csv::{
             DIALECT_NAMES, Dialect, DictReader, DictWriter, FIELD_SIZE_LIMIT, FmtParams, Quoting, Reader, Writer,
             write_method,
@@ -35,19 +35,20 @@ use crate::{
 };
 
 /// Module-level `csv` functions; `DictReader` and `DictWriter` are types.
+#[monty_macros::explicit_discriminants(checksum = 0x761e_5c0a_a9b7_9c94)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, serde::Serialize, serde::Deserialize)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum CsvFunctions {
     /// `csv.reader(csvfile, dialect='excel', **fmtparams)`.
-    Reader,
+    Reader = 0,
     /// `csv.writer(csvfile, dialect='excel', **fmtparams)`.
-    Writer,
+    Writer = 1,
     /// `csv.get_dialect(name)`.
-    GetDialect,
+    GetDialect = 2,
     /// `csv.list_dialects()`.
-    ListDialects,
+    ListDialects = 3,
     /// `csv.field_size_limit([new_limit])`.
-    FieldSizeLimit,
+    FieldSizeLimit = 4,
 }
 
 /// Creates the `csv` module.
@@ -136,23 +137,16 @@ fn load_then_call(
     file_keyword: Option<&str>,
     vm: &mut VM<'_>,
 ) -> Result<CallResult, ArgValues> {
-    let file = args
+    let Some(file) = args
         .first_positional()
-        .or_else(|| file_keyword.and_then(|name| args.keyword(name, vm.heap, vm.interns)));
-    let file_id = match file {
-        Some(Value::Ref(id))
-            if let HeapReadOutput::OpenFile(file) = vm.heap.read(*id)
-                && file.needs_buffer_load(vm) =>
-        {
-            *id
-        }
-        _ => return Err(args),
-    };
-    let HeapReadOutput::OpenFile(file) = vm.heap.read(file_id) else {
-        unreachable!("checked above")
+        .or_else(|| file_keyword.and_then(|name| args.keyword(name, vm.heap, vm.interns)))
+        .and_then(|value| value.read_as::<OpenFile>(vm.heap))
+        .filter(|file| file.needs_buffer_load(vm))
+    else {
+        return Err(args);
     };
     let effect = PostConversionEffect::LoadThenCall {
-        file_id,
+        file_id: file.id(),
         callable,
         args,
     };
@@ -260,7 +254,7 @@ fn call_list_dialects(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         .iter()
         .map(|name| allocate_string(*name, vm.heap))
         .collect();
-    Ok(Value::Ref(vm.heap.allocate(HeapData::List(List::new(names)))))
+    Ok(Value::allocate(List::new(names), vm.heap))
 }
 
 /// `get_dialect(name)`: Argument Clinic, so `name` may be a keyword.
@@ -469,7 +463,7 @@ fn materialize_fieldnames(fieldnames: &mut Value, vm: &mut VM<'_>) -> RunResult<
     defer_drop!(iterator, vm);
     if iterator.is(fieldnames) {
         let names = collect_iterable(fieldnames, vm)?;
-        let list = Value::Ref(vm.heap.allocate(HeapData::List(List::new(names))));
+        let list = Value::allocate(List::new(names), vm.heap);
         mem::replace(fieldnames, list).drop_with(vm);
     }
     Ok(())

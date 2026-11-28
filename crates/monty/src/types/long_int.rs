@@ -30,7 +30,7 @@ use crate::{
     bytecode::{CallResult, VM},
     exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::{HashValue, hash_python_long_int},
-    heap::{DropWithContext, Heap, HeapData, HeapObjectRead},
+    heap::{DropWithContext, Heap, HeapObjectRead},
     identity::Identity,
     intern::{LongIntId, StaticStrings},
     resource_checks::{check_div_size, check_lshift_size, check_mult_size, check_pow_size},
@@ -219,6 +219,16 @@ impl<'h> PyInt<'h> {
                 }
             },
         )
+    }
+
+    /// Computes `int.as_integer_ratio()`, returning `(self, 1)`.
+    pub(crate) fn as_integer_ratio(&self, vm: &VM<'h>) -> Value {
+        let num = match self {
+            Self::Small(value) => Value::Int(*value),
+            Self::Interned(id) => Value::InternLongInt(*id),
+            Self::Heap(value) => value.clone_value(vm.heap),
+        };
+        allocate_tuple(smallvec![num, Value::Int(1)], vm.heap)
     }
 }
 
@@ -484,6 +494,14 @@ impl<'h> PyTrait<'h> for PyInt<'h> {
                 args.check_zero_args("int.bit_count", vm.heap)?;
                 Ok(CallResult::Value(self.bit_count(vm)))
             }
+            Some(StaticStrings::AsIntegerRatio) => {
+                args.check_zero_args("int.as_integer_ratio", vm.heap)?;
+                Ok(CallResult::Value(self.as_integer_ratio(vm)))
+            }
+            Some(StaticStrings::IsInteger) => {
+                args.check_zero_args("int.is_integer", vm.heap)?;
+                Ok(CallResult::Value(Value::Bool(true)))
+            }
             _ => {
                 args.drop_with(vm.heap);
                 Err(ExcType::attribute_error("int", attr.as_str(vm.interns)))
@@ -511,14 +529,9 @@ fn multiply_bigint(lhs: &BigInt, other: &Value, vm: &VM<'_>) -> RunResult<Option
             Value::Int(0)
         }),
         Value::Float(rhs) => Some(Value::Float(bigint_to_f64_checked(lhs)? * rhs)),
-        Value::InternLongInt(id) => {
-            let rhs = vm.interns.get_long_int(*id);
+        _ if let Some(rhs) = other.as_long_int(vm) => {
             check_mult_size(lhs.bits(), rhs.bits(), &vm.heap.tracker)?;
             Some(LongInt::new(lhs * rhs).into_value(vm.heap))
-        }
-        Value::Ref(id) if let HeapData::LongInt(rhs) = vm.heap.get(*id) => {
-            check_mult_size(lhs.bits(), rhs.bits(), &vm.heap.tracker)?;
-            Some(LongInt::new(lhs * rhs.inner()).into_value(vm.heap))
         }
         _ => None,
     };
@@ -531,8 +544,7 @@ fn add_bigint(lhs: &BigInt, other: &Value, vm: &VM<'_>) -> RunResult<Option<Valu
         Value::Int(rhs) => lhs + rhs,
         Value::Bool(rhs) => lhs + i64::from(*rhs),
         Value::Float(rhs) => return Ok(Some(Value::Float(bigint_to_f64_checked(lhs)? + rhs))),
-        Value::InternLongInt(id) => lhs + vm.interns.get_long_int(*id),
-        Value::Ref(id) if let HeapData::LongInt(rhs) = vm.heap.get(*id) => lhs + rhs.inner(),
+        _ if let Some(rhs) = other.as_long_int(vm) => lhs + rhs,
         _ => return Ok(None),
     };
     Ok(Some(LongInt::new(result).into_value(vm.heap)))
@@ -541,8 +553,7 @@ fn add_bigint(lhs: &BigInt, other: &Value, vm: &VM<'_>) -> RunResult<Option<Valu
 /// Allocates an `i128` already known not to fit the immediate integer representation.
 pub(crate) fn wide_i128_into_value(value: i128, heap: &Heap) -> Value {
     debug_assert!(i64::try_from(value).is_err());
-    let id = heap.allocate(HeapData::LongInt(LongInt::new(BigInt::from(value))));
-    Value::Ref(id)
+    Value::allocate(LongInt::new(BigInt::from(value)), heap)
 }
 
 impl LongInt {
@@ -559,8 +570,7 @@ impl LongInt {
             Value::Int(value)
         } else {
             let long_int = Self::new(BigInt::from(value));
-            let heap_id = heap.allocate(HeapData::LongInt(long_int));
-            Value::Ref(heap_id)
+            Value::allocate(long_int, heap)
         }
     }
 
@@ -593,8 +603,7 @@ impl LongInt {
         if let Some(i) = self.0.to_i64() {
             Value::Int(i)
         } else {
-            let heap_id = heap.allocate(HeapData::LongInt(self));
-            Value::Ref(heap_id)
+            Value::allocate(self, heap)
         }
     }
 
@@ -621,31 +630,11 @@ impl LongInt {
         self.0.is_zero()
     }
 
-    /// Checks if the value is negative.
-    pub fn is_negative(&self) -> bool {
-        self.0.is_negative()
-    }
-
-    /// Tries to convert to i64.
-    ///
-    /// Returns `Some(i64)` if the value fits, `None` otherwise.
-    pub fn to_i64(&self) -> Option<i64> {
-        self.0.to_i64()
-    }
-
     /// Converts to `f64`, raising `OverflowError` when the magnitude exceeds the float range.
     ///
     /// Mirrors CPython's `PyLong_AsDouble`, which every mixed int/float operation goes through.
     pub fn to_f64_checked(&self) -> RunResult<f64> {
         bigint_to_f64_checked(&self.0)
-    }
-
-    /// Compares this integer against an `f64` *exactly* (no precision loss).
-    ///
-    /// Thin wrapper around [`bigint_cmp_f64`]; see it for the semantics. The
-    /// result is the ordering of `self` relative to `f`.
-    pub fn partial_cmp_f64(&self, f: f64) -> Option<Ordering> {
-        bigint_cmp_f64(&self.0, f)
     }
 
     /// Returns the number of significant bits in this LongInt.
@@ -1168,9 +1157,7 @@ fn integer_value<'a>(value: &Value, vm: &'a VM<'_>) -> Option<Cow<'a, BigInt>> {
     match value {
         Value::Int(value) => Some(Cow::Owned(BigInt::from(*value))),
         Value::Bool(value) => Some(Cow::Owned(BigInt::from(*value))),
-        Value::InternLongInt(id) => Some(Cow::Borrowed(vm.interns.get_long_int(*id))),
-        Value::Ref(id) if let HeapData::LongInt(value) = vm.heap.get(*id) => Some(Cow::Borrowed(value.inner())),
-        _ => None,
+        _ => value.as_long_int(vm).map(Cow::Borrowed),
     }
 }
 

@@ -19,14 +19,17 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     expressions::CmpOperator,
     hash::{HashValue, hash_f64, hash_named, hash_one},
-    heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput},
+    heap::{
+        ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapObjectRead, HeapPayload, HeapReadOutput,
+        HeapReader,
+    },
     identity::Identity,
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
     portable_math,
     py_value::PyValue,
     types::{
-        BytesIterator, CmpOrder, Complex, LazyHeapSet, Property, PyTrait, Type, TypeRef,
+        Bytes, BytesIterator, CmpOrder, Complex, HeapStr, LazyHeapSet, LongInt, Property, PyTrait, Type, TypeRef,
         bytes::PyBytes,
         decimal,
         instance::{class_defines, instance_getattr, instance_str, instance_user_eq, subclass_overrides},
@@ -140,7 +143,7 @@ impl<'h> ValueRead<'h, '_> {
             Self::Heap { value, steps } => {
                 vm.heap.tracker.check_memory_time_every(*steps)?;
                 *steps += 1;
-                value.py_next(vm)
+                value.next_sync(vm)
             }
         }
     }
@@ -342,47 +345,26 @@ impl<'h> PyTrait<'h> for Value {
             // Int/float ordering is exact (no rounding of either operand).
             (Self::Int(s), Self::Float(o)) => Ok(CmpOrder::from_numeric(i64_cmp_f64(*s, *o))),
             (Self::Float(s), Self::Int(o)) => Ok(CmpOrder::from_numeric(i64_cmp_f64(*o, *s).map(Ordering::reverse))),
-            (Self::Int(a), Self::InternLongInt(b)) => Ok(CmpOrder::Ordered(
-                bigint_cmp_i64(interns.get_long_int(*b), *a).reverse(),
-            )),
-            (Self::InternLongInt(a), Self::Int(b)) => {
-                Ok(CmpOrder::Ordered(bigint_cmp_i64(interns.get_long_int(*a), *b)))
+            (Self::Int(a), rhs) if let Some(b) = rhs.as_long_int(vm) => {
+                Ok(CmpOrder::Ordered(bigint_cmp_i64(b, *a).reverse()))
             }
-            (Self::Float(a), Self::InternLongInt(b)) => Ok(CmpOrder::from_numeric(
-                bigint_cmp_f64(interns.get_long_int(*b), *a).map(Ordering::reverse),
-            )),
-            (Self::InternLongInt(a), Self::Float(b)) => {
-                Ok(CmpOrder::from_numeric(bigint_cmp_f64(interns.get_long_int(*a), *b)))
+            (lhs, Self::Int(b)) if let Some(a) = lhs.as_long_int(vm) => Ok(CmpOrder::Ordered(bigint_cmp_i64(a, *b))),
+            (Self::Float(a), rhs) if let Some(b) = rhs.as_long_int(vm) => {
+                Ok(CmpOrder::from_numeric(bigint_cmp_f64(b, *a).map(Ordering::reverse)))
             }
-            (Self::InternLongInt(a), Self::InternLongInt(b)) => Ok(CmpOrder::Ordered(
-                interns.get_long_int(*a).cmp(interns.get_long_int(*b)),
-            )),
+            (lhs, Self::Float(b)) if let Some(a) = lhs.as_long_int(vm) => {
+                Ok(CmpOrder::from_numeric(bigint_cmp_f64(a, *b)))
+            }
+            (Self::InternLongInt(a), rhs) if let Some(b) = rhs.as_long_int(vm) => {
+                Ok(CmpOrder::Ordered(interns.get_long_int(*a).cmp(b)))
+            }
+            (lhs, Self::InternLongInt(b)) if let Some(a) = lhs.as_long_int(vm) => {
+                Ok(CmpOrder::Ordered(a.cmp(interns.get_long_int(*b))))
+            }
             // Bool promotion: convert to Int and re-dispatch. Recursion is bounded
             // to at most 2 levels (Bool→Int, then Int matches directly above).
             (Self::Bool(s), _) => Self::Int(i64::from(*s)).py_cmp(other, vm),
             (_, Self::Bool(s)) => self.py_cmp(&Self::Int(i64::from(*s)), vm),
-            // Int vs LongInt comparison
-            (Self::Int(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-                Ok(CmpOrder::Ordered(bigint_cmp_i64(li.inner(), *a).reverse()))
-            }
-            (Self::InternLongInt(a), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-                Ok(CmpOrder::Ordered(interns.get_long_int(*a).cmp(li.inner())))
-            }
-            // LongInt vs Int comparison
-            (Self::Ref(id), Self::Int(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-                Ok(CmpOrder::Ordered(bigint_cmp_i64(li.inner(), *b)))
-            }
-            (Self::Ref(id), Self::InternLongInt(b)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-                Ok(CmpOrder::Ordered(li.inner().cmp(interns.get_long_int(*b))))
-            }
-            // Float vs LongInt comparison (exact, no precision loss)
-            (Self::Float(s), Self::Ref(id)) if let HeapData::LongInt(li) = vm.heap.get(*id) => Ok(
-                CmpOrder::from_numeric(bigint_cmp_f64(li.inner(), *s).map(Ordering::reverse)),
-            ),
-            // LongInt vs Float comparison (exact, no precision loss)
-            (Self::Ref(id), Self::Float(o)) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-                Ok(CmpOrder::from_numeric(li.partial_cmp_f64(*o)))
-            }
             // Ref vs Ref comparison: same-kind heap values, then a `Decimal` operand
             (Self::Ref(id1), Self::Ref(id2)) => {
                 let order = cmp_heap_pair(*id1, *id2, vm)?;
@@ -822,7 +804,7 @@ impl<'h> PyTrait<'h> for Value {
         }
     }
 
-    fn py_next(&mut self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
+    fn py_next(&mut self, vm: &mut VM<'_>) -> RunResult<Option<CallResult>> {
         if let Self::Ref(id) = self {
             PyValue::from_heap(*id, vm.heap).py_next(vm)
         } else {
@@ -902,6 +884,11 @@ impl<C: ContainsHeap> DropWithContext<C> for Value {
 }
 
 impl Value {
+    /// Allocates a heap payload and transfers its initial reference to the returned value.
+    pub(crate) fn allocate<T: HeapPayload>(payload: T, heap: &Heap) -> Self {
+        Self::Ref(heap.allocate(payload.into_heap_data()))
+    }
+
     /// Opens a Python-type view without copying heap payloads or borrowing this owner.
     /// Drop the view before releasing the owning `Value`, so its heap readers are gone at cleanup.
     pub(crate) fn py_value<'h>(&self, vm: &VM<'h>) -> PyValue<'h> {
@@ -1169,11 +1156,6 @@ impl Value {
         <Self as PyTrait<'_>>::py_iter(self, vm)
     }
 
-    /// Advances this value synchronously for native iterator consumers.
-    pub(crate) fn py_next(&mut self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
-        <Self as PyTrait<'_>>::py_next(self, vm)
-    }
-
     /// Converts an owned value into its Python iterator and releases the original reference.
     ///
     /// This is the ownership-preserving entry point for Rust consumers of the
@@ -1195,11 +1177,18 @@ impl Value {
         }
     }
 
+    /// Borrows the referenced payload for the lifetime of the heap borrow.
+    pub(crate) fn get_as<'a, T: HeapPayload>(&self, heap: &'a Heap) -> Option<&'a T> {
+        T::from_heap_data(heap.get(self.ref_id()?))
+    }
+
+    /// Opens a typed reader when this value references a heap object of type `T`.
+    pub(crate) fn read_as<'h, T: HeapPayload>(&self, heap: &HeapReader<'h>) -> Option<HeapObjectRead<'h, T>> {
+        heap.read_as::<T>(self.ref_id()?)
+    }
+
     /// Reads the heap entry this value references, or `None` if it is not a
     /// heap reference.
-    ///
-    /// Used by per-type [`PyTrait::py_eq_impl`] impls to resolve the other operand
-    /// to a heap object of their own type, returning `NotImplemented` otherwise.
     pub(crate) fn read_heap<'a>(&self, vm: &VM<'a>) -> Option<HeapReadOutput<'a>> {
         match self {
             Self::Ref(id) => Some(vm.heap.read(*id)),
@@ -1469,31 +1458,15 @@ impl Value {
     /// The value is already validated as an int by [`PyTrait::py_index_impl`],
     /// so the non-int arms are unreachable.
     fn narrow_index_to_i64(index: Self, vm: &mut VM<'_>, on_overflow: impl FnOnce() -> RunError) -> RunResult<i64> {
-        let converted = match &index {
+        defer_drop!(index, vm);
+        match index {
             Self::Int(i) => Ok(*i),
             Self::Bool(b) => Ok(i64::from(*b)),
-            Self::InternLongInt(id) => vm.interns.get_long_int(*id).to_i64().ok_or_else(on_overflow),
-            Self::Ref(id) => match vm.heap.get(*id) {
-                HeapData::LongInt(li) => li.to_i64().ok_or_else(on_overflow),
-                _ => unreachable!("py_index_impl validated the result is an int"),
-            },
-            _ => unreachable!("py_index_impl validated the result is an int"),
-        };
-        index.drop_with(vm);
-        converted
-    }
-
-    /// True when this is a `LongInt`-valued int (interned or heap-allocated)
-    /// that is negative — lets fixed-width consumers pick the right overflow
-    /// direction/message (`round`'s i64 clamp, `os`'s fd converter). False for
-    /// every other value, `Int`/`Bool` included: pair it with
-    /// [`is_long_int`](crate::args::is_long_int) rather than using it alone to
-    /// classify an int.
-    pub(crate) fn long_int_is_negative(&self, vm: &VM<'_>) -> bool {
-        match self {
-            Self::InternLongInt(id) => vm.interns.get_long_int(*id).sign() == Sign::Minus,
-            Self::Ref(id) => matches!(vm.heap.get(*id), HeapData::LongInt(li) if li.is_negative()),
-            _ => false,
+            _ => index
+                .as_long_int(vm)
+                .expect("py_index_impl validated the result is an int")
+                .to_i64()
+                .ok_or_else(on_overflow),
         }
     }
 
@@ -1507,14 +1480,7 @@ impl Value {
     /// must reject out-of-range ints — [`Self::as_int`] and [`Self::as_index`]
     /// raise there instead.
     pub(crate) fn long_int_to_i64_saturating(&self, vm: &VM<'_>) -> Option<i64> {
-        match self {
-            Self::InternLongInt(id) => Some(saturating_i64(vm.interns.get_long_int(*id))),
-            Self::Ref(id) => match vm.heap.get(*id) {
-                HeapData::LongInt(li) => Some(saturating_i64(li.inner())),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.as_long_int(vm).map(saturating_i64)
     }
 
     /// Borrows the arbitrary-precision value of a `LongInt`-valued int (interned
@@ -1523,11 +1489,7 @@ impl Value {
     pub(crate) fn as_long_int<'a>(&self, vm: &'a VM<'_>) -> Option<&'a BigInt> {
         match self {
             Self::InternLongInt(id) => Some(vm.interns.get_long_int(*id)),
-            Self::Ref(id) => match vm.heap.get(*id) {
-                HeapData::LongInt(li) => Some(li.inner()),
-                _ => None,
-            },
-            _ => None,
+            _ => self.get_as::<LongInt>(vm.heap).map(LongInt::inner),
         }
     }
 
@@ -1942,12 +1904,29 @@ impl Value {
         match self {
             Self::InternString(id) => Some(EitherStr::Interned(*id)),
             Self::InlineString(text) => Some(EitherStr::Inline(*text)),
-            Self::Ref(heap_id) => match heap.get(*heap_id) {
-                HeapData::Str(s) => Some(EitherStr::Heap(s.as_str().to_owned())),
-                _ => None,
-            },
-            _ => None,
+            _ => self
+                .get_as::<HeapStr>(heap)
+                .map(|s| EitherStr::Heap(s.as_str().to_owned())),
         }
+    }
+
+    /// Borrows the contents of interned or heap-allocated bytes.
+    pub(crate) fn as_bytes<'a>(&self, vm: &'a VM<'_>) -> Option<&'a [u8]> {
+        self.as_bytes_heap(vm.heap, vm.interns)
+    }
+
+    /// [`as_bytes`](Self::as_bytes) for callers with a separate heap and intern table.
+    pub(crate) fn as_bytes_heap<'a>(&self, heap: &'a Heap, interns: &'a Interns) -> Option<&'a [u8]> {
+        match self {
+            Self::InternBytes(id) => Some(interns.get_bytes(*id)),
+            _ => self.get_as::<Bytes>(heap).map(Bytes::as_slice),
+        }
+    }
+
+    /// Borrows a bytes argument or raises the buffer protocol's type error.
+    pub(crate) fn try_as_bytes<'a>(&self, vm: &'a VM<'_>) -> RunResult<&'a [u8]> {
+        self.as_bytes(vm)
+            .ok_or_else(|| ExcType::type_error_bytes_like(self.py_type_name(vm)))
     }
 
     /// Borrows string contents without allocating, or returns `None` for non-strings.
@@ -1960,24 +1939,20 @@ impl Value {
         match self {
             Self::InternString(string_id) => Some(interns.get_str(*string_id)),
             Self::InlineString(text) => Some(text.as_str()),
-            Self::Ref(heap_id) => match heap.get(*heap_id) {
-                HeapData::Str(s) => Some(s.as_str()),
-                _ => None,
-            },
-            _ => None,
+            _ => self.get_as::<HeapStr>(heap).map(HeapStr::as_str),
         }
     }
 
     /// Borrows string contents, or raises `TypeError` with `expected string, not <type>`.
-    pub(crate) fn try_to_str<'a>(&'a self, vm: &'a VM<'_>) -> RunResult<&'a str> {
-        self.try_to_str_heap(vm.heap, vm.interns)
+    pub(crate) fn try_as_str<'a>(&'a self, vm: &'a VM<'_>) -> RunResult<&'a str> {
+        self.try_as_str_heap(vm.heap, vm.interns)
     }
 
-    /// [`try_to_str`](Self::try_to_str) for contexts without a `&VM` — takes `heap` and
+    /// [`try_as_str`](Self::try_as_str) for contexts without a `&VM` — takes `heap` and
     /// `interns` separately so callers can keep a disjoint `&mut` borrow of
     /// another `VM` field alive (e.g. resolving a `str` `Value` produced by
     /// `py_str` while writing it to `vm.print_writer`).
-    pub(crate) fn try_to_str_heap<'a>(&'a self, heap: &'a Heap, interns: &'a Interns) -> RunResult<&'a str> {
+    pub(crate) fn try_as_str_heap<'a>(&'a self, heap: &'a Heap, interns: &'a Interns) -> RunResult<&'a str> {
         self.as_str_heap(heap, interns).ok_or_else(|| {
             ExcType::type_error(format!(
                 "expected string, not {}",
@@ -2030,9 +2005,7 @@ pub(crate) fn eq_i64(a: i64, other: &Value, vm: &VM<'_>) -> Option<bool> {
         Value::Int(b) => Some(a == *b),
         Value::Bool(b) => Some(a == i64::from(*b)),
         Value::Float(f) => Some(i64_cmp_f64(a, *f) == Some(Ordering::Equal)),
-        Value::InternLongInt(id) => Some(bigint_eq_i64(vm.interns.get_long_int(*id), a)),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => Some(bigint_eq_i64(li.inner(), a)),
-        _ => None,
+        _ => other.as_long_int(vm).map(|big| bigint_eq_i64(big, a)),
     }
 }
 
@@ -2042,9 +2015,7 @@ pub(crate) fn eq_f64(f: f64, other: &Value, vm: &VM<'_>) -> Option<bool> {
         Value::Float(o) => Some(f == *o),
         Value::Int(o) => Some(i64_cmp_f64(*o, f) == Some(Ordering::Equal)),
         Value::Bool(o) => Some(i64_cmp_f64(i64::from(*o), f) == Some(Ordering::Equal)),
-        Value::InternLongInt(id) => Some(bigint_eq_f64(vm.interns.get_long_int(*id), f)),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => Some(bigint_eq_f64(li.inner(), f)),
-        _ => None,
+        _ => other.as_long_int(vm).map(|big| bigint_eq_f64(big, f)),
     }
 }
 
@@ -2056,9 +2027,7 @@ pub(crate) fn eq_bigint(b: &BigInt, other: &Value, vm: &VM<'_>) -> Option<bool> 
         Value::Int(o) => Some(bigint_eq_i64(b, *o)),
         Value::Bool(o) => Some(bigint_eq_i64(b, i64::from(*o))),
         Value::Float(f) => Some(bigint_eq_f64(b, *f)),
-        Value::InternLongInt(id) => Some(b == vm.interns.get_long_int(*id)),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => Some(b == li.inner()),
-        _ => None,
+        _ => other.as_long_int(vm).map(|big| b == big),
     }
 }
 
@@ -2074,11 +2043,7 @@ pub(crate) fn eq_str(s: &str, other: &Value, vm: &VM<'_>) -> Option<bool> {
 
 /// `b == other`, resolving the other operand from interned or heap bytes.
 pub(crate) fn eq_bytes(b: &[u8], other: &Value, vm: &VM<'_>) -> Option<bool> {
-    match other {
-        Value::InternBytes(id) => Some(b == vm.interns.get_bytes(*id)),
-        Value::Ref(id) if let HeapData::Bytes(o) = vm.heap.get(*id) => Some(b == o.as_slice()),
-        _ => None,
-    }
+    other.as_bytes(vm).map(|bytes| b == bytes)
 }
 
 /// A string name that can outlive a heap borrow.
@@ -2419,7 +2384,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        heap::HeapReader,
         run::{Program, SessionTables},
         types::{
             LongInt,

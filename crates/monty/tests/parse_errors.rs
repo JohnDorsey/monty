@@ -10,11 +10,93 @@ fn get_parse_err(code: impl Into<String>) -> MontyException {
     result.expect_err("expected parse error")
 }
 
+/// `yield` outside a function or inside a comprehension's own scope, and `yield from` in an
+/// `async def`, are rejected with CPython's messages; a comprehension's first iterable
+/// belongs to the enclosing scope.
 #[test]
-fn yield_expressions_return_not_implemented_error() {
-    let err = get_parse_err("def foo():\n    yield 1");
+fn misplaced_yield_returns_syntax_error() {
+    let mut messages = String::new();
+    for code in [
+        "yield 1",
+        "yield from [1]",
+        "class C:\n    x = yield 1",
+        "def f():\n    class C:\n        x = yield from [1]",
+        "def f(x=(yield)):\n    pass",
+        "def f():\n    return [(yield x) for x in [1]]",
+        "def f():\n    return [(yield from x) for x in [1]]",
+        "def f():\n    return {(yield x) for x in [1]}",
+        "def f():\n    return {x: (yield x) for x in [1]}",
+        "def f():\n    return ((yield x) for x in [1])",
+        "def f():\n    return [x for x in [1] if (yield x)]",
+        "def f():\n    return [y for x in [1] for y in (yield)]",
+        "async def f():\n    yield from x",
+        "async def f():\n    yield 1\n    yield from x",
+    ] {
+        let err = get_parse_err(code);
+        assert_eq!(err.exc_type(), ExcType::SyntaxError, "{code}");
+        writeln!(messages, "{}", err.message().unwrap()).unwrap();
+    }
+    assert_snapshot!(messages, @"
+    'yield' outside function
+    'yield from' outside function
+    'yield' outside function
+    'yield from' outside function
+    'yield' outside function
+    'yield' inside list comprehension
+    'yield' inside list comprehension
+    'yield' inside set comprehension
+    'yield' inside dict comprehension
+    'yield' inside generator expression
+    'yield' inside list comprehension
+    'yield' inside list comprehension
+    'yield from' inside async function
+    'yield from' inside async function
+    ");
+}
+
+/// Yields CPython accepts: a comprehension's first iterable and a lambda body.
+#[test]
+fn yield_in_enclosing_scopes_compiles() {
+    for code in [
+        "def f():\n    return [x for x in (yield)]",
+        "lambda: (yield)",
+        "def f():\n    return [lambda: (yield x) for x in [1]]",
+    ] {
+        MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    }
+}
+
+#[test]
+fn async_generators_return_not_implemented_error() {
+    let err = get_parse_err("async def f():\n    yield 1");
     assert_eq!(err.exc_type(), ExcType::NotImplementedError);
-    assert_snapshot!(err.message().unwrap(), @"The monty syntax parser does not yet support yield expressions");
+    assert_snapshot!(err.message().unwrap(), @"The monty syntax parser does not yet support async generator functions");
+}
+
+#[test]
+fn async_generator_expression_body_is_rejected() {
+    insta::allow_duplicates! {
+        for code in [
+            "async def f():\n    return (await g(x) for x in [1])",
+            "async def f():\n    return (f'{x:{await width()}}' for x in [1])",
+            "async def f():\n    return ([await g(x) for x in [1]] for _ in [0])",
+        ] {
+            let err = get_parse_err(code);
+            assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+            assert_snapshot!(err.message().unwrap(), @"The monty syntax parser does not yet support async generator expressions");
+        }
+    }
+}
+
+#[test]
+fn comprehension_walrus_checks() {
+    let rebind = get_parse_err("((x := 1) for x in [0])");
+    assert_eq!(rebind.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(rebind.message().unwrap(), @"assignment expression cannot rebind comprehension iteration variable 'x'");
+
+    let in_iterable = get_parse_err("(x for x in (lambda: (items := [1]))())");
+    assert_eq!(in_iterable.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(in_iterable.message().unwrap(), @"assignment expression cannot be used in a comprehension iterable expression");
 }
 
 #[test]
@@ -105,16 +187,6 @@ fn method_default_walrus_returns_not_implemented_error() {
     assert_snapshot!(
         err.message().unwrap(),
         @"The monty syntax parser does not yet support assignment expressions (`:=`) in class bodies"
-    );
-}
-
-#[test]
-fn method_decorators_return_not_implemented_error() {
-    let err = get_parse_err("class Foo:\n    @staticmethod\n    def m(): pass");
-    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
-    assert_snapshot!(
-        err.message().unwrap(),
-        @"The monty syntax parser does not yet support method decorators (classmethod/staticmethod/property)"
     );
 }
 
@@ -1091,4 +1163,95 @@ fn function_with_too_many_closure_variables_returns_syntax_error() {
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(err.message(), Some("more than 255 closure variables (256)"));
+}
+
+#[test]
+fn await_in_sync_function_raises_syntax_error() {
+    let err = get_parse_err("def f():\n    await g()");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside async function");
+}
+
+#[test]
+fn await_in_lambda_raises_syntax_error() {
+    let err = get_parse_err("f = lambda: await g()");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside async function");
+}
+
+#[test]
+fn await_in_sync_nested_function_inside_async_raises_syntax_error() {
+    let code = "\
+async def outer():
+    def inner():
+        return await g()
+    return inner()";
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside async function");
+}
+
+#[test]
+fn await_in_sync_comprehension_inside_sync_function_raises_syntax_error() {
+    let code = "\
+def f():
+    return [await g() for _ in [1]]";
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside async function");
+}
+
+#[test]
+fn await_in_class_body_raises_syntax_error() {
+    let err = get_parse_err("class C:\n    x = await g()");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside function");
+}
+
+#[test]
+fn await_in_class_body_inside_async_function_raises_syntax_error() {
+    let code = "\
+async def f():
+    class C:
+        x = await g()";
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside function");
+}
+
+#[test]
+fn await_in_sync_method_raises_syntax_error() {
+    let code = "\
+class C:
+    def method(self):
+        await g()";
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"'await' outside async function");
+}
+
+#[test]
+fn await_in_async_method_compiles_successfully() {
+    let code = "\
+class C:
+    async def method(self):
+        return await g()";
+    let result = MontyRun::new(code.to_string(), "test.py", vec![], CompileOptions::default());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn await_in_async_function_compiles_successfully() {
+    let code = "\
+async def f():
+    return await g()";
+    let result = MontyRun::new(code.to_string(), "test.py", vec![], CompileOptions::default());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn await_at_script_top_level_compiles_successfully() {
+    let code = "x = await g()";
+    let result = MontyRun::new(code.to_string(), "test.py", vec![], CompileOptions::default());
+    assert!(result.is_ok());
 }

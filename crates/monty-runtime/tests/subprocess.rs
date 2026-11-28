@@ -16,9 +16,9 @@ use monty_proto::{
     WireFunctionCall, exceeds_max_frame_len, ext_result_to_proto, named_values_to_proto, pb, write_frame,
 };
 use monty_types::{
-    CallArgs, DateTimeSource, ExtFunctionResult, FileMode, IMPORT_STUBS_CALL_ID, MontyDate, MontyDateTime,
-    MontyFileHandle, MontyObject, NameLookupResult, NamedValues, OsPolicy, RandomSeed, RandomStart, SandboxTimeZone,
-    SleepMode, SourceRange,
+    CallArgs, DateTimeSource, ExcType, ExtFunctionResult, FileMode, IMPORT_STUBS_CALL_ID, MontyDate, MontyDateTime,
+    MontyException, MontyFileHandle, MontyObject, NameLookupResult, NamedValues, OsPolicy, RandomSeed, RandomStart,
+    SandboxTimeZone, SleepMode, SourceRange,
     scan::{EntryInfo, ScanEntry, scan_reply},
     unstable::{self, MontyNode},
 };
@@ -61,18 +61,24 @@ impl ChildProc {
     /// Spawns the worker with its stderr inherited, so diagnostics show up in
     /// the test output.
     fn spawn() -> Self {
-        Self::spawn_with(Stdio::inherit())
+        Self::spawn_with(Stdio::inherit(), &[])
+    }
+
+    /// Spawns a child that builds its type checker while idle (`--prewarm-type-checker`).
+    fn spawn_warm() -> Self {
+        Self::spawn_with(Stdio::inherit(), &["--prewarm-type-checker"])
     }
 
     /// Spawns the worker with its stderr captured, for tests asserting on the
     /// diagnostics it prints before dying (see [`Self::reap_with_stderr`]).
     fn spawn_stderr_piped() -> Self {
-        Self::spawn_with(Stdio::piped())
+        Self::spawn_with(Stdio::piped(), &[])
     }
 
-    fn spawn_with(stderr: Stdio) -> Self {
+    fn spawn_with(stderr: Stdio, args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_monty"))
             .arg("subprocess")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -88,7 +94,7 @@ impl ChildProc {
             &mut self.writer,
             &pb::ClientRequest {
                 kind: Some(kind),
-                trace_parent: None,
+                traceparent: None,
             },
         )
         .expect("failed to write request");
@@ -204,6 +210,35 @@ impl ChildProc {
         self.send(pb::client_request::Kind::ResumeCall(pb::ResumeCall {
             call_id,
             result: Some(result),
+            values,
+        }));
+        self.recv_turn()
+    }
+
+    /// Answers a suspended call with a future that the parent resolves later.
+    fn resume_future(&mut self, call_id: u32) -> (Vec<pb::Print>, pb::worker_event::Kind) {
+        let (result, values) = ext_result_to_proto(ExtFunctionResult::Future(call_id));
+        self.send(pb::client_request::Kind::ResumeCall(pb::ResumeCall {
+            call_id,
+            result: Some(result),
+            values,
+        }));
+        self.recv_turn()
+    }
+
+    /// Answers one pending future after a `ResolveFutures` suspension.
+    fn resume_futures_one(
+        &mut self,
+        call_id: u32,
+        result: ExtFunctionResult,
+    ) -> (Vec<pb::Print>, pb::worker_event::Kind) {
+        let (result, values) = ext_result_to_proto(result);
+        self.send(pb::client_request::Kind::ResumeFutures(pb::ResumeFutures {
+            results: vec![pb::FutureResult {
+                call_id,
+                result: Some(result),
+            }]
+            .into(),
             values,
         }));
         self.recv_turn()
@@ -1007,6 +1042,26 @@ fn small_memory_limit_leaves_normal_work_alone() {
     child.shutdown();
 }
 
+/// Building the indent must reject oversized allocations even for an empty document.
+#[test]
+fn json_large_indent_preserves_the_worker() {
+    for code in [
+        "import json\njson.dumps([], indent=10**8)",
+        "import json\nclass Writer:\n    def write(self, text):\n        pass\njson.dump([], Writer(), indent=10**8)",
+    ] {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(10 * 1024 * 1024));
+        let (_, event) = child.feed(code);
+        assert_eq!(expect_error(event).exc_type, "MemoryError", "{code}");
+        assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
+        assert_eq!(
+            child.feed_complete("json.dumps([1], indent=2)"),
+            MontyObject::string("[\n  1\n]"),
+        );
+        child.shutdown();
+    }
+}
+
 /// Crossing the interpreter's soft limit raises an ordinary session error
 /// rather than killing the worker, and unwinding releases the incomplete result.
 #[test]
@@ -1045,6 +1100,85 @@ fn memory_errors_in_user_str_and_repr_are_uncatchable() {
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
         child.shutdown();
     }
+}
+
+/// A host that rejects the wait timer call must time the wait out like a fired
+/// timer, not raise from the `await`: the timer already decided the wait's fate.
+#[test]
+fn rejected_wait_timer_completes_as_timeout() {
+    let mut child = ChildProc::spawn();
+    child.create_repl();
+    let code = "import asyncio\n\nasync def done():\n    return 1\n\nasync def main():\n    t = asyncio.create_task(done())\n    done_set, pending = await asyncio.wait([t], timeout=1)\n    return len(done_set) + len(pending)\n\nasyncio.run(main())";
+    let (_, event) = child.feed(code);
+    let pb::worker_event::Kind::OsCall(call) = event else {
+        panic!("expected timer OsCall, got {event:?}");
+    };
+    let Some(pb::os_call::Call::AsyncSystemSleep(sleep)) = call.call else {
+        panic!("expected async sleep, got {:?}", call.call);
+    };
+    assert_eq!(sleep.delay.to_bits(), 1.0f64.to_bits());
+    let exc = pb::RaisedException {
+        exc_type: "RuntimeError".to_owned(),
+        message: Some("timer rejected".to_owned()),
+        traceback: BudgetVec::new(),
+        data: None,
+    };
+    let (_, event) = child.resume_call(call.call_id, pb::ext_function_result::Kind::Error(exc));
+    assert_eq!(expect_complete(event), MontyObject::int(1));
+    child.shutdown();
+}
+
+/// The wait timer's host answer only signals that the timer fired, so an
+/// unconvertible value must not fail the wait. The host may answer it after
+/// the wait already has other pending futures, where the value is discarded.
+#[test]
+fn wait_timer_answer_is_not_converted_after_a_future() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    let code = "import asyncio\n\nasync def main():\n    t = asyncio.create_task(asyncio.sleep(3600))\n    done, pending = await asyncio.wait([t], timeout=1)\n    return len(done) + len(pending)\n\nasyncio.run(main())";
+    let (_, event) = child.feed(code);
+    let first = match event {
+        pb::worker_event::Kind::OsCall(call) => call,
+        other => panic!("expected OsCall, got {other:?}"),
+    };
+    let (_, event) = child.resume_future(first.call_id);
+    let second = match event {
+        pb::worker_event::Kind::OsCall(call) => call,
+        other => panic!("expected second OsCall, got {other:?}"),
+    };
+    let delay = |call: &pb::OsCall| match &call.call {
+        Some(pb::os_call::Call::AsyncSystemSleep(sleep)) => sleep.delay,
+        other => panic!("expected async sleep, got {other:?}"),
+    };
+    let second_id = second.call_id;
+    let (timer, task) = if delay(&first).to_bits() == 1.0f64.to_bits() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(delay(&timer).to_bits(), 1.0f64.to_bits());
+    assert_eq!(delay(&task).to_bits(), 10.0f64.to_bits());
+    let (_, event) = child.resume_future(second_id);
+    let pb::worker_event::Kind::ResolveFutures(state) = event else {
+        panic!("expected ResolveFutures, got {event:?}");
+    };
+    assert_eq!(state.pending_call_ids.len(), 2);
+    let invalid = MontyObject::repr("discarded timer value".to_owned());
+    let (_, event) = child.resume_futures_one(timer.call_id, ExtFunctionResult::Return(invalid));
+    assert_eq!(expect_complete(event), MontyObject::int(1));
+    child.shutdown();
+}
+
+/// Queueing a used coroutine thousands of times makes every task fail at
+/// startup. Selecting the successor for each failure must not recurse on the
+/// native stack, or a normal program can overflow it before any limit fires.
+#[test]
+fn used_coroutines_do_not_recurse_while_starting_tasks() {
+    let mut child = ChildProc::spawn();
+    child.create_repl();
+    let code = "import asyncio\n\nasync def c():\n    return 1\n\nasync def main():\n    coro = c()\n    await coro\n    tasks = [asyncio.create_task(coro) for _ in range(5000)]\n    return len(tasks)\n\nasyncio.run(main())";
+    assert_eq!(child.feed_complete(code), MontyObject::int(5000));
+    child.shutdown();
 }
 
 /// Async scheduler state is allocator-accounted even though it lives outside
@@ -1252,149 +1386,154 @@ fn copy_of_a_near_limit_dict_raises_rather_than_dying() {
 fn large_allocations_are_rejected_before_the_hard_limit() {
     // each case with the allocator usage it should be refused at
     let cases = [
-        ("'x' * 10_000_000", 10_044_245),
+        ("'x' * 10_000_000", 10_044_501),
         // Each formatter builder must fail softly before the worker reaches its hard ceiling.
-        ("s = 'x' * 400_000\n'{0}{0}'.format(s)", 1_244_679),
-        ("s = 'x' * 400_000\n'{0:>1000000}'.format(s)", 1_444_711),
-        ("s = 'é' * 200_000\n'{0!a}'.format(s)", 1_244_716),
+        ("s = 'x' * 400_000\n'{0}{0}'.format(s)", 1_244_935),
+        ("s = 'x' * 400_000\n'{0:>1000000}'.format(s)", 1_444_967),
+        ("s = 'é' * 200_000\n'{0!a}'.format(s)", 1_244_972),
         // `%` formatting: padding, float digits, integer zero-extension and output growth.
-        ("'%*d' % (2_000_000, 1)", 2_044_277),
-        ("'%.*f' % (1_000_000, 1.0)", 1_173_316),
+        ("'%*d' % (2_000_000, 1)", 2_044_533),
+        ("'%.*f' % (1_000_000, 1.0)", 1_173_572),
         // A `%` presentation copies its digits into a builder to add the suffix, refused there.
-        ("f'{0.5:.700000%}'", 1_444_269),
-        ("'%.*d' % (2_000_000, 1)", 2_044_281),
-        ("s = 'x' * 400_000\n'%s%s' % (s, s)", 1_644_606),
-        ("b'%*d' % (2_000_000, 1)", 2_052_499),
-        ("s = b'x' * 400_000\nb'%s%s' % (s, s)", 1_652_829),
-        ("b'x' * 10_000_000", 10_052_479),
-        ("[None] * 1_000_000", 16_044_279),
-        ("2 ** 10_000_000", 10_044_244),
-        ("1 << 10_000_000", 1_294_245),
+        ("f'{0.5:.700000%}'", 1_444_525),
+        ("'%.*d' % (2_000_000, 1)", 2_044_537),
+        ("s = 'x' * 400_000\n'%s%s' % (s, s)", 1_644_862),
+        ("b'%*d' % (2_000_000, 1)", 2_052_755),
+        ("s = b'x' * 400_000\nb'%s%s' % (s, s)", 1_653_085),
+        ("b'x' * 10_000_000", 10_052_735),
+        ("[None] * 1_000_000", 16_044_535),
+        ("2 ** 10_000_000", 10_044_500),
+        ("1 << 10_000_000", 1_294_501),
         // `int / int` scales one operand before dividing; both shift directions are
         // preflighted.
-        ("x = 1 << 3_000_000\nx / (x - 1)", 1_544_614),
-        ("x = 1 << 3_000_000\nx / (x >> 100)", 1_544_597),
+        ("x = 1 << 3_000_000\nx / (x - 1)", 1_544_870),
+        ("x = 1 << 3_000_000\nx / (x >> 100)", 1_544_853),
         // `math.factorial`, `comb` and `perm` preflight their product's size.
-        ("import math\nmath.factorial(2_000_000)", 10_549_350),
+        ("import math\nmath.factorial(2_000_000)", 10_549_606),
         // A binomial is bounded by `2**n`, so `comb` needs a larger `n` to trip the check.
-        ("import math\nmath.comb(9_000_000, 4_500_000)", 2_299_492),
-        ("import math\nmath.perm(4_000_000, 2_000_000)", 11_049_492),
+        ("import math\nmath.comb(9_000_000, 4_500_000)", 2_299_748),
+        ("import math\nmath.perm(4_000_000, 2_000_000)", 11_049_748),
         // `math.lcm` of two large coprime ints is a product, preflighted like `*`.
-        ("import math\nx = 1 << 2_000_000\nmath.lcm(x + 1, x - 1)", 1_299_839),
-        ("('a' * 1000).replace('a', 'b' * 2000)", 2_047_539),
+        ("import math\nx = 1 << 2_000_000\nmath.lcm(x + 1, x - 1)", 1_300_095),
+        ("('a' * 1000).replace('a', 'b' * 2000)", 2_047_795),
         // Every `%Z` copies the zone name into a `StringBuilder`, refused at a
         // capacity doubling like the formatter cases above: fixed-size pushes
-        // make that step deterministic.
+        // make that step deterministic. Formatting borrows the receiver's zone name.
         (
             "from datetime import datetime, timezone, timedelta\ntz = timezone(timedelta(0), 'n' * 100_000)\ndatetime(2024, 1, 1, tzinfo=tz).strftime('%Z' * 5_000)",
-            1_255_965,
+            1_155_965,
         ),
         // Bulk container clones: `+=` preflights the temp clone plus the target
         // growth, `+` preflights each side's clone.
-        ("x = [None] * 40_000\nx += x", 1_964_483),
-        ("t = (None,) * 40_000\nt + t", 1_324_611),
-        ("x = [None] * 40_000\nx.copy()", 1_324_613),
+        ("x = [None] * 40_000\nx += x", 1_964_739),
+        ("t = (None,) * 40_000\nt + t", 1_324_867),
+        ("x = [None] * 40_000\nx.copy()", 1_324_869),
         // A container repr polls the limits between items: crossing the memory
         // limit raises rather than truncating the way a timeout does.
-        ("x = [None] * 50_000\nlen(repr(x))", 1_106_811),
+        ("x = [None] * 50_000\nlen(repr(x))", 1_107_067),
         // The other container reprs poll the same way, each from its own loop.
         (
             "s = 'x' * 200\nd = dict.fromkeys(range(5_000), s)\nlen(repr(d))",
-            1_495_358,
+            1_495_614,
         ),
         // The mapping copy reserves 4,000 entries instead of retaining the
         // 4,096-entry buffer from incremental insertion, lowering repr's baseline.
         (
             "from collections import Counter\ns = 'x' * 200\nc = Counter({(i, s): 1 for i in range(4_000)})\nlen(repr(c))",
-            1_100_974,
+            1_101_230,
         ),
         (
             "import functools\ns = 'x' * 200\np = functools.partial(print, *([s] * 5_000))\nlen(repr(p))",
-            1_338_165,
+            1_338_421,
         ),
         (
             "import functools\ns = 'x' * 400\np = functools.partial(print, **{f'k{i}': s for i in range(2_500)})\nlen(repr(p))",
-            1_389_801,
+            1_390_057,
         ),
-        ("s = 'x' * 200\ng = list[(s,) * 5_000]\nlen(repr(g))", 1_173_780),
+        ("s = 'x' * 200\ng = list[(s,) * 5_000]\nlen(repr(g))", 1_174_036),
         (
             "import typing\ns = 'x' * 600\nu = typing.Union[tuple(list[i, s] for i in range(2_000))]\nlen(repr(u))",
-            1_529_389,
+            1_532_827,
         ),
         // `dict | dict` snapshots the left pairs and builds the merged dict
         // while that snapshot is live, so both are preflighted together.
-        ("d = dict.fromkeys(range(12_000))\nd | {}", 1_807_474),
+        ("d = dict.fromkeys(range(12_000))\nd | {}", 1_807_730),
         // The right operand is snapshotted inside the same call, so that copy is
         // preflighted too. Only the copy: see the overlap test below.
-        ("d = dict.fromkeys(range(12_000))\n{} | d", 1_231_474),
+        ("d = dict.fromkeys(range(12_000))\n{} | d", 1_231_730),
         // A partial re-clones its bound arguments on every call, so that clone
         // is preflighted like any other bulk container copy.
         (
             "import functools\ndef f(*a):\n    return 0\np = functools.partial(f, *range(20_000))\njunk = [None] * 40_000\np()",
-            1_328_267,
+            1_328_523,
         ),
         // Reading `p.args` / `p.keywords` rebuilds them in full, so both are
         // preflighted like any other bulk container copy.
         (
             "import functools\ndef f(*a):\n    return 0\np = functools.partial(f, *range(20_000))\njunk = [0] * 40_000\np.args",
-            1_328_267,
+            1_328_523,
         ),
         (
             "import functools\ndef f(**k):\n    return 0\np = functools.partial(f, **{str(i): i for i in range(6_000)})\njunk = [0] * 30_000\np.keywords",
-            1_104_447,
+            1_104_703,
         ),
         // A `typing` alias copies its subscript into its `__args__`, and a class's
         // `__annotations__` copies the namespace into the dict the annotations
         // evaluate under; both are preflighted like any container copy.
-        ("from typing import Tuple\nTuple[(None,) * 40_000]", 1_325_081),
+        ("from typing import Tuple\nTuple[(None,) * 40_000]", 1_325_337),
         (
             "class C:\n    x: int\nfor i in range(16_000):\n    setattr(C, str(i), i)\nC.__annotations__",
-            1_146_638,
+            1_146_894,
         ),
         // `Literal` copies its values to deduplicate them, `Callable` its
         // parameter list; both copies are preflighted.
-        ("from typing import Literal\nLiteral[(None,) * 40_000]", 1_325_093),
-        ("from typing import Callable\nCallable[[None] * 40_000, int]", 1_325_113),
+        ("from typing import Literal\nLiteral[(None,) * 40_000]", 1_325_349),
+        ("from typing import Callable\nCallable[[None] * 40_000, int]", 1_325_369),
         // `__metadata__` copies an `Annotated` alias's metadata, preflighted too.
         (
             "from typing import Annotated\nmeta = (None,) * 12_000\na = Annotated[(int,) + meta]\njunk = [None] * 30_000\na.__metadata__",
-            1_171_846,
+            1_172_102,
         ),
         // Flattening a nested `Annotated` copies both aliases' arguments into
         // one buffer, preflighted as a whole.
         (
             "from typing import Annotated\nmeta = (None,) * 12_000\ninner = Annotated[(int,) + meta]\nAnnotated[(inner,) + meta]",
-            1_408_101,
+            1_408_357,
         ),
         // Comparing or hashing a `Literal` copies its values again, so an alias
         // that fits is refused when the copy would not.
         (
             "from typing import Literal\nL = Literal[tuple(range(10_000))]\njunk = [None] * 40_000\nL == L",
-            1_107_763,
+            1_108_019,
         ),
         (
             "from typing import Literal\nL = Literal[tuple(range(10_000))]\njunk = [None] * 40_000\nhash(L)",
-            1_107_764,
+            1_108_020,
         ),
         // `deque.extend` preflights exact-hint iterators up front.
         (
             "from collections import deque\nd = deque()\nd.extend(range(1_000_000))",
-            16_044_735,
+            16_044_991,
         ),
         // `re.finditer` preflights the matches it builds from its scanned spans as a whole.
-        ("import re\nre.finditer('ab', 'ab ' * 10_000)", 3_217_455),
-        ("import re\nre.finditer('(a)(b)', 'ab ' * 10_000)", 4_596_301),
+        ("import re\nre.finditer('ab', 'ab ' * 10_000)", 3_218_319),
+        ("import re\nre.finditer('(a)(b)', 'ab ' * 10_000)", 4_597_165),
         // A split's piece buffer is grown under the same checks as `re.split`'s.
-        ("('ab,' * 100_000).split(',')", 1_392_992),
-        ("('ab,' * 100_000).rsplit(',')", 1_392_993),
-        ("(b'ab ' * 100_000).split()", 1_401_082),
-        ("(b'ab,' * 100_000).rsplit(b',')", 1_401_217),
+        ("('ab,' * 100_000).split(',')", 1_393_248),
+        ("('ab,' * 100_000).rsplit(',')", 1_393_249),
+        ("(b'ab ' * 100_000).split()", 1_401_338),
+        ("(b'ab,' * 100_000).rsplit(b',')", 1_401_473),
         // Empty lines allocate no heap entry, so only the line buffer's growth check sees them.
         ("('\\n' * 200_000).splitlines()", 1_292_858),
+        // `str.translate` grows its output through a builder on lookup misses too, not only for mapped values.
+        (
+            "s = 'a' + 'b' * 240_000\nlen(s.translate({97: 'x' * 240_000}))",
+            1_245_188,
+        ),
         // The json encoder preflights each doubling of its output buffer.
-        ("import json\njson.dumps(['x' * 1000] * 2000)", 1_168_792),
+        ("import json\njson.dumps(['x' * 1000] * 2000)", 1_169_048),
         // `randbytes` charges its word buffer and the byte buffer it fills.
-        ("import random\nrandom.seed(0)\nrandom.randbytes(600_000)", 1_249_287),
+        ("import random\nrandom.seed(0)\nrandom.randbytes(600_000)", 1_249_543),
         // A `range` population can be as long as `i64::MAX` while costing nothing,
         // so `sample` must saturate its size arithmetic and refuse the pick buffer.
         (
@@ -1405,78 +1544,129 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         // that result past the limit while the counter and its pairs still fit.
         (
             "import statistics\njunk = [None] * 12_000\nstatistics.multimode(range(8_000))",
-            1_096_974,
+            1_097_230,
+        ),
+        // An io stream's buffer is preflighted at each doubling, including through `print(file=)`.
+        (
+            "import _io\ns = 'x' * 300_000\nb = _io.StringIO()\nfor _ in range(3):\n    b.write(s)",
+            1_246_590,
+        ),
+        (
+            "import _io\ns = 'x' * 300_000\nb = _io.StringIO()\nfor _ in range(3):\n    print(s, file=b)",
+            1_246_742,
+        ),
+        (
+            "import _io\ns = b'x' * 300_000\nb = _io.BytesIO()\nfor _ in range(3):\n    b.write(s)",
+            1_254_799,
+        ),
+        // `readlines` grows its list under the same checks as `splitlines`.
+        ("import _io\n_io.StringIO('\\n' * 100_000).readlines()", 1_194_779),
+        ("import _io\n_io.BytesIO(b'\\n' * 100_000).readlines()", 1_065_226),
+        // A write past the end of an io stream pads the gap, which is preflighted.
+        (
+            "import _io\ns = _io.StringIO()\ns.seek(10_000_000)\ns.write('x')",
+            10_046_477,
+        ),
+        (
+            "import _io\nb = _io.BytesIO()\nb.seek(10_000_000)\nb.write(b'x')",
+            10_054_686,
+        ),
+        // Copying a stream's buffer out is preflighted: the copy can match the whole budget.
+        (
+            "import _io\nb = _io.BytesIO()\nb.seek(600_000)\nb.write(b'x')\nb.getvalue()",
+            1_254_769,
+        ),
+        (
+            "import _io\nb = _io.BytesIO()\nb.seek(600_000)\nb.write(b'x')\nb.seek(0)\nb.read()",
+            1_254_783,
+        ),
+        (
+            "import _io, copy\nb = _io.BytesIO()\nb.seek(600_000)\nb.write(b'x')\ncopy.copy(b)",
+            1_255_491,
+        ),
+        (
+            "import _io\ns = _io.StringIO()\ns.seek(600_000)\ns.write('x')\ns.getvalue()",
+            1_246_560,
+        ),
+        (
+            "import _io\ns = _io.StringIO()\ns.seek(600_000)\ns.write('x')\ns.seek(0)\ns.readline()",
+            1_246_578,
+        ),
+        // `newline='\r\n'` can double the text it translates, so the copy and its translation are preflighted.
+        (
+            "import _io\nt = '\\n' * 400_000\n_io.StringIO(newline='\\r\\n').write(t)",
+            1_646_558,
         ),
         // `itertools.batched` preflights one batch, capped at `n`.
         (
             "import itertools\nnext(itertools.batched(range(1_000_000), 1_000_000))",
-            16_046_872,
+            16_047_128,
         ),
         // The two combinatoric iterators whose width is not bounded by their
         // pool preflight that width: `r` repeats of a one-item pool, and
         // `repeat` copies of the argument list.
         (
             "import itertools\nnext(itertools.combinations_with_replacement('a', 1_000_000))",
-            24_046_943,
+            24_047_199,
         ),
         (
             "import itertools\nnext(itertools.product('ab', repeat=1_000_000))",
-            24_047_005,
+            24_047_261,
         ),
         // A SHAKE digest preflights its output; `hexdigest` also counts the raw
         // digest it keeps live while encoding, so a length whose hex alone
         // would fit is still refused.
-        ("import hashlib\nhashlib.shake_128().digest(2_000_000)", 2_047_733),
-        ("import hashlib\nhashlib.shake_128().hexdigest(400_000)", 1_247_734),
+        ("import hashlib\nhashlib.shake_128().digest(2_000_000)", 2_047_989),
+        ("import hashlib\nhashlib.shake_128().hexdigest(400_000)", 1_247_990),
         // A csv record copies its fields' text into the line, refused at a capacity
         // doubling like the formatter cases above.
         (
             "import csv\nclass S:\n    def write(self, t):\n        pass\ns = 'x' * 400_000\ncsv.writer(S()).writerow([s, s])",
-            1_251_359,
+            1_251_615,
         ),
         // A `DictReader` row's dict is sized from `fieldnames` up front, preflighted like a
         // dict copy.
         (
             "import csv\nnames = list(range(30_000))\nnext(csv.DictReader(['x'], fieldnames=names))",
-            1_967_962,
+            1_968_218,
         ),
         // A list `fieldnames` is copied per row, and the keys of a row dict are copied for
         // the `extrasaction='raise'` check: both bulk copies are preflighted.
         (
             "import csv\nclass S:\n    def write(self, t):\n        pass\nnames = [None] * 40_000\ncsv.DictWriter(S(), names).writerow({})",
-            1_331_396,
+            1_331_652,
         ),
         (
             "import csv\nclass S:\n    def write(self, t):\n        pass\nrow = {i: None for i in range(10_000)}\ncsv.DictWriter(S(), []).writerow(row)",
-            1_079_933,
+            1_080_189,
         ),
         // A key can return an existing repr; copying repeated reprs into the error
         // message must still respect the budget.
         (
             "import csv\nclass S:\n    def write(self, t):\n        pass\ntext = 'x' * 400_000\nclass Key:\n    def __repr__(self):\n        return text\nrow = {Key(): None, Key(): None}\ncsv.DictWriter(S(), []).writerow(row)",
-            1_254_895,
+            1_255_693,
         ),
         // `decimal` preflights results whose size scales with an exponent or the
         // precision: an integer conversion, `f` formatting, and division, `sqrt`,
         // `quantize` and the largest finite value (`next_minus` from infinity) under
         // a large `prec`.
-        ("import decimal\nint(decimal.Decimal('1e3000000'))", 3_048_538),
-        ("import decimal\nf'{decimal.Decimal(\"1e3000000\"):f}'", 3_048_429),
+        ("import decimal\nint(decimal.Decimal('1e3000000'))", 3_048_794),
+        ("import decimal\nf'{decimal.Decimal(\"1e3000000\"):f}'", 3_048_685),
         (
             "import decimal\ndecimal.getcontext().prec = 3_000_000\ndecimal.Decimal(1) / 3",
-            3_048_830,
+            3_049_086,
         ),
         (
             "import decimal\ndecimal.getcontext().prec = 3_000_000\ndecimal.Decimal(2).sqrt()",
-            6_048_865,
+            6_049_121,
         ),
         (
             "import decimal\ndecimal.getcontext().prec = 3_000_000\ndecimal.Decimal(1).quantize(decimal.Decimal('1e-2500000'))",
-            2_548_965,
+            2_549_221,
         ),
         (
             "import decimal\ndecimal.getcontext().prec = 3_000_000\ndecimal.Decimal('Infinity').next_minus()",
-            3_048_930,
+            3_049_186,
         ),
     ];
 
@@ -1490,7 +1680,7 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         "from dataclasses import dataclass\ns = 'x' * 6_000\n@dataclass\nclass C:\n{fields}c = C(*([s] * 200))\nlen(repr(c))"
     );
     let cases = cases.map(|(code, expected)| (code.to_owned(), expected));
-    for (code, expected) in cases.into_iter().chain([(dataclass, 1_248_099)]) {
+    for (code, expected) in cases.into_iter().chain([(dataclass, 1_248_355)]) {
         let code = code.as_str();
         let mut child = ChildProc::spawn();
         child.create_repl_with(configure_with_max_memory(1024 * 1024));
@@ -1503,21 +1693,162 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         child.shutdown();
     }
 
-    for code in [
-        "a = [None] * 1_000_000\na *= 2",
-        "a = [None] * 1_000_000\na += range(1_000_000)",
-        "from collections import deque\nd = deque([None] * 500_000)\nd *= 4",
+    for (code, max_memory) in [
+        ("a = [None] * 1_000_000\na *= 2", 24 * 1024 * 1024),
+        ("a = [None] * 1_000_000\na += range(1_000_000)", 24 * 1024 * 1024),
+        (
+            "from collections import deque\nd = deque([None] * 500_000)\nd *= 4",
+            24 * 1024 * 1024,
+        ),
         // The line buffer's next doubling would land past the hard headroom.
-        "('\\n' * 2_000_000).splitlines()",
+        ("('\\n' * 2_000_000).splitlines()", 24 * 1024 * 1024),
+        // Case methods and `re.escape` check their result before building it; a non-ASCII mapping that
+        // outgrows its input (`'ΐ'.upper()` is 6 bytes from 2) is checked as it grows.
+        ("s = 'x' * (16 * 1024 * 1024)\ns.lower()", 24 * 1024 * 1024),
+        ("s = 'x' * (16 * 1024 * 1024)\ns.title()", 24 * 1024 * 1024),
+        ("s = 'é' * (8 * 1024 * 1024)\ns.upper()", 24 * 1024 * 1024),
+        ("s = 'ΐ' * (4 * 1024 * 1024)\ns.upper()", 24 * 1024 * 1024),
+        ("import re\nre.escape(' ' * (10 * 1024 * 1024))", 24 * 1024 * 1024),
+        // Async cases carry storage the guest never sees: the wait input list,
+        // one wait slot per input, fanned-out exception copies and timer
+        // storage. Their payload is sized against their own budget so the
+        // preflight is what refuses, not the allocator's hard ceiling.
+        (
+            r"import asyncio
+
+async def immediate():
+    return 1
+
+async def main():
+    tasks = [asyncio.create_task(immediate()) for _ in range(10_000)]
+    await asyncio.wait(tasks, timeout=0)
+
+asyncio.run(main())",
+            9 * 1024 * 1024,
+        ),
+        (
+            r"import asyncio
+
+async def coro():
+    return 1
+
+async def main():
+    await asyncio.create_task(coro(), name='x' * (24 * 1024 * 1024))
+
+asyncio.run(main())",
+            32 * 1024 * 1024,
+        ),
+        (
+            r"import asyncio
+
+async def coro():
+    return 1
+
+async def main():
+    task = asyncio.create_task(coro(), name='x' * (12 * 1024 * 1024))
+    junk = 'y' * (2 * 1024 * 1024)
+    return task.get_name()
+
+asyncio.run(main())",
+            26 * 1024 * 1024,
+        ),
+        (
+            r"import asyncio
+
+async def fail():
+    raise ValueError('x' * (12 * 1024 * 1024))
+
+async def main():
+    task = asyncio.create_task(fail())
+    try:
+        await task
+    except ValueError:
+        pass
+    junk = 'y' * (32 * 1024 * 1024)
+    task.exception()
+    return 1
+
+asyncio.run(main())",
+            64 * 1024 * 1024,
+        ),
+        (
+            r"import asyncio
+
+async def main():
+    done = asyncio.create_task(asyncio.sleep(0))
+    await done
+    await asyncio.wait([done], return_when='x' * (24 * 1024 * 1024))
+
+asyncio.run(main())",
+            32 * 1024 * 1024,
+        ),
+        // A terminal error while committing `wait(...)` cannot be cached on the
+        // task `create_task` would return; it must abort the feed.
+        (
+            r"import asyncio
+
+class Alloc:
+    def __eq__(self, other):
+        'x' * 2_000_000
+        return False
+
+async def f():
+    return 1
+
+async def main():
+    t = asyncio.create_task(f())
+    w = asyncio.wait([t], return_when=Alloc())
+    asyncio.create_task(w)
+    return 'continued'
+
+asyncio.run(main())",
+            1024 * 1024,
+        ),
     ] {
         let mut child = ChildProc::spawn();
-        child.create_repl_with(configure_with_max_memory(24 * 1024 * 1024));
+        child.create_repl_with(configure_with_max_memory(max_memory));
         let (_, event) = child.feed(code);
         let error = expect_error(event);
         assert_eq!(error.exc_type, "MemoryError", "{code}");
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
         child.shutdown();
     }
+
+    // A failed task fans its exception out to every waiter in one batch, so the
+    // copies must be preflighted together. This case needs a host error to take
+    // that path: a sandbox `raise` hands the failure to one waiter at a time, so
+    // the copies are never live together.
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(8 * 1024 * 1024));
+    let code = r"import asyncio
+
+async def waiter(task):
+    try:
+        await task
+    except ValueError:
+        pass
+
+async def main():
+    task = asyncio.create_task(external())
+    waiters = [asyncio.create_task(waiter(task)) for _ in range(1_000)]
+    await asyncio.gather(*waiters)
+
+asyncio.run(main())";
+    let (_, event) = child.feed(code);
+    let pb::worker_event::Kind::FunctionCall(call) = event else {
+        panic!("expected external FunctionCall, got {event:?}");
+    };
+    let call_id = call.call_id;
+    let (_, event) = child.resume_future(call_id);
+    let pb::worker_event::Kind::ResolveFutures(state) = event else {
+        panic!("expected ResolveFutures, got {event:?}");
+    };
+    assert!(state.pending_call_ids.contains(&call_id));
+    let exc = MontyException::new(ExcType::ValueError, Some("x".repeat(500_000)));
+    let (_, event) = child.resume_futures_one(call_id, ExtFunctionResult::Error(exc));
+    assert_eq!(expect_error(event).exc_type, "MemoryError");
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2));
+    child.shutdown();
 
     let mut child = ChildProc::spawn();
     child.create_repl_with(configure_with_max_memory(24 * 1024 * 1024));
@@ -1559,7 +1890,7 @@ fn dict_writer_rows_are_rejected_before_the_hard_limit() {
     let error = expect_error(event);
     assert_eq!(error.exc_type, "MemoryError", "{code}");
     let message = error.message.expect("MemoryError should have a message");
-    assert_reported_usage(&message, 1_208_604, code);
+    assert_reported_usage(&message, 1_208_620, code);
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
     child.shutdown();
 }
@@ -1581,7 +1912,7 @@ fn expandvars_growth_is_rejected_before_the_hard_limit() {
     let error = expect_error(event);
     assert_eq!(error.exc_type, "MemoryError", "{code}");
     let message = error.message.expect("MemoryError should have a message");
-    assert_reported_usage(&message, 1_374_212, code);
+    assert_reported_usage(&message, 1_374_228, code);
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
     child.shutdown();
 }
@@ -1817,7 +2148,7 @@ fn iterdir_joins_are_preflighted() {
     let error = expect_error(event);
     assert_eq!(error.exc_type, "MemoryError");
     let message = error.message.expect("MemoryError should have a message");
-    assert_reported_usage(&message, 2_247_009, code);
+    assert_reported_usage(&message, 2_247_025, code);
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2));
     child.shutdown();
 }
@@ -2437,6 +2768,44 @@ fn refused_findall_leaves_no_partial_result() {
     }
 }
 
+/// `str.translate` validates its arguments before copying the receiver, so an
+/// invalid call on a string too large to copy raises `TypeError`, not `MemoryError`.
+#[test]
+fn translate_checks_args_before_copying_receiver() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    assert_eq!(
+        child.feed_complete("s = 'x' * 600_000\nlen(s)"),
+        MontyObject::int(600_000)
+    );
+    for (code, message) in [
+        ("s.translate()", "str.translate() takes exactly one argument (0 given)"),
+        ("s.translate(table={})", "str.translate() takes no keyword arguments"),
+    ] {
+        let (_, event) = child.feed(code);
+        let error = expect_error(event);
+        assert_eq!(
+            (error.exc_type.as_str(), error.message.as_deref()),
+            ("TypeError", Some(message)),
+            "{code}"
+        );
+    }
+    child.shutdown();
+}
+
+/// A write to a closed `BytesIO` reports the closure even when copying its payload would cross
+/// `max_memory`, as CPython checks closure before it copies.
+#[test]
+fn closed_bytes_io_write_reports_closure_before_memory() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    let (_, event) = child.feed("import io\nb = io.BytesIO()\nb.close()\nb.write(b'x' * 600_000)");
+    let error = expect_error(event);
+    assert_eq!(error.exc_type, "ValueError");
+    assert_eq!(error.message.as_deref(), Some("I/O operation on closed file."));
+    child.shutdown();
+}
+
 /// Assert a `memory limit exceeded` message reports roughly `expected` bytes
 /// used against a 1 MiB limit.
 ///
@@ -2581,6 +2950,22 @@ fn expanding_codecs_fail_softly() {
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{call}");
         child.shutdown();
     }
+}
+
+/// A custom ignorechars needs a copy of the input while the decoder holds its output buffer.
+#[test]
+fn a85decode_budgets_for_custom_ignorechars() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(2_400_000));
+    child.feed_complete("import base64\nsrc = b'!' * 1_000_000");
+    assert_eq!(
+        child.feed_complete("len(base64.a85decode(src))"),
+        MontyObject::int(800_000)
+    );
+
+    let (_, event) = child.feed("len(base64.a85decode(src, ignorechars=b''))");
+    assert_eq!(expect_error(event).exc_type, "MemoryError");
+    child.shutdown();
 }
 
 /// A conversion that appends to, or frames, a buffer it filled exactly must
@@ -2900,7 +3285,18 @@ fn type_check_format_selects_the_rendering() {
 
 #[test]
 fn reset_releases_type_checker_memory() {
-    let mut child = ChildProc::spawn();
+    assert_reset_releases_type_checker_memory(ChildProc::spawn());
+}
+
+/// The warm checker is charged to the worker baseline, and rebuilt after each
+/// type-checked session, without ever counting against a session's `max_memory`.
+#[test]
+fn reset_releases_prewarm_type_checker_memory() {
+    assert_reset_releases_type_checker_memory(ChildProc::spawn_warm());
+}
+
+/// Alternates small-budget sessions with a type-checked one in a single child.
+fn assert_reset_releases_type_checker_memory(mut child: ChildProc) {
     let program = format!("def f(a: int, b: int) -> None:\n    pass\n{}", "f(1, 2)\n".repeat(900));
 
     for _ in 0..3 {
@@ -2943,6 +3339,41 @@ fn reset_releases_type_checker_memory() {
 /// Both sessions use the same worker so a fresh worker cannot hide retained state.
 #[test]
 fn reset_isolates_type_check_state_from_the_next_session() {
+    assert_reset_isolates_type_check_state(ChildProc::spawn());
+}
+
+/// A warm worker hands its checker to the first type-checked session and builds a fresh one
+/// after it, so the same isolation holds.
+#[test]
+fn reset_isolates_warm_type_check_state_from_the_next_session() {
+    assert_reset_isolates_type_check_state(ChildProc::spawn_warm());
+}
+
+/// A warm checker's builtins are charged to the worker baseline, so a type-checked
+/// session runs within a 2 MB budget, which still rejects a large allocation, for
+/// the rebuilt checker too.
+#[test]
+fn prewarm_type_checker_is_outside_session_memory() {
+    let mut child = ChildProc::spawn_warm();
+    for _ in 0..2 {
+        child.create_repl_with(pb::Configure {
+            type_check: true,
+            ..configure_with_max_memory(2_000_000)
+        });
+        assert_eq!(
+            child.feed_complete("x = 'a b'.split()\ny = 'x' * 500_000\nlen(x)"),
+            MontyObject::int(2)
+        );
+        let (_, event) = child.feed("z = 'x' * 3_000_000");
+        assert_eq!(expect_error(event).exc_type, "MemoryError");
+        child.send(pb::client_request::Kind::Reset(pb::Reset {}));
+        assert!(matches!(child.recv(), pb::worker_event::Kind::Ok(_)));
+    }
+    child.shutdown();
+}
+
+/// Probes, in one child, that each session's script and stubs are gone after `Reset`.
+fn assert_reset_isolates_type_check_state(mut child: ChildProc) {
     // (script_name of session A, module path session B tries to import)
     let cases = [
         ("a.py", "a"),
@@ -2950,7 +3381,6 @@ fn reset_isolates_type_check_state_from_the_next_session() {
         ("../escape.py", "escape"),
         ("/abs.py", "abs"),
     ];
-    let mut child = ChildProc::spawn();
     for (script_name, module) in cases {
         // Session A: commits one snippet and carries stubs.
         child.create_repl_with(pb::Configure {
@@ -2964,6 +3394,15 @@ fn reset_isolates_type_check_state_from_the_next_session() {
         });
         assert_eq!(child.feed_complete("LEAKY = 'hunter2'"), MontyObject::none());
 
+        child.send(pb::client_request::Kind::Reset(pb::Reset {}));
+        let pb::worker_event::Kind::Ok(_) = child.recv() else {
+            panic!("expected Ok for Reset");
+        };
+
+        // An untyped session in between: a warm worker keeps its checker across one,
+        // which must not carry session A's files along.
+        child.create_repl();
+        assert_eq!(child.feed_complete("x = 1"), MontyObject::none());
         child.send(pb::client_request::Kind::Reset(pb::Reset {}));
         let pb::worker_event::Kind::Ok(_) = child.recv() else {
             panic!("expected Ok for Reset");
@@ -3622,6 +4061,28 @@ fn slice_assignment_rejects_large_replacement_without_killing_worker() {
         let (_, event) = child.feed(code);
         assert_eq!(expect_error(event).exc_type, "MemoryError", "{code}");
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2));
+        child.shutdown();
+    }
+}
+
+/// A suspended generator's saved locals stay charged to `max_memory`, directly
+/// or behind a `yield from`, so holding many of them raises `MemoryError`.
+#[test]
+fn suspended_generators_remain_charged_to_memory_limit() {
+    for definition in [
+        "def generate(arg):\n    yield arg",
+        "def inner(arg):\n    yield arg\ndef generate(arg):\n    yield from inner(arg)",
+    ] {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(1024 * 1024));
+        let (_, event) = child.feed(&format!(
+            "{definition}\ngenerators = []\nfor _ in range(1000):\n    g = generate([None] * 10000)\n    next(g)\n    generators.append(g)"
+        ));
+        assert_eq!(expect_error(event).exc_type, "MemoryError", "{definition}");
+        assert_eq!(
+            child.feed_complete("generators = None\ng = None\n1 + 1"),
+            MontyObject::int(2)
+        );
         child.shutdown();
     }
 }

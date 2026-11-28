@@ -16,7 +16,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     fstring::FormatFloat,
-    heap::{ContainsHeap, DropWithContext, HeapData, HeapId, HeapRead},
+    heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapRead},
     intern::StaticStrings,
     os_dispatch::{PendingEffect, PostConversionEffect},
     string_builder::StringBuilder,
@@ -24,7 +24,9 @@ use crate::{
         CsvObject, PyTrait, Type, TypeRef,
         csv::dialect::{Dialect, Quoting},
         instance,
+        io::{is_memory_stream, is_native_stream},
         iter::collect_owned_iterable,
+        sequence::SequenceItems,
         str::allocate_string,
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -36,8 +38,8 @@ pub(crate) struct Writer {
     /// The `csvfile` argument. Owned.
     target: Value,
     /// `csvfile.write`, bound at construction as CPython does, so rebinding the attribute
-    /// later does not redirect writes. `None` for a file target, whose write is a host call
-    /// through `target`. Owned.
+    /// later does not redirect writes. `None` for a file or io stream target, whose `write`
+    /// is called by name through `target`. Owned.
     write: Value,
     /// Shared with each record written, so a row costs no copy of the dialect's strings.
     pub(crate) dialect: Arc<Dialect>,
@@ -57,9 +59,9 @@ impl Writer {
         is_file(&self.target, vm)
     }
 
-    /// An owned clone of the bound `write` (`None` for a file target).
-    pub(crate) fn write_method(&self, heap: &impl ContainsHeap) -> Value {
-        self.write.clone_with_heap(heap)
+    /// Owned clones of the target and its bound `write` (`None` for a file or io stream).
+    pub(crate) fn target_and_write(&self, heap: &impl ContainsHeap) -> (Value, Value) {
+        (self.target.clone_with_heap(heap), self.write.clone_with_heap(heap))
     }
 
     /// Invokes `on_child` for each heap id this writer owns (GC trace hook).
@@ -82,7 +84,7 @@ impl Writer {
 /// does: `Some(Value::None)` for a file target (its write is a host call), `None` when
 /// `target` cannot back a writer. The caller owns the returned callable.
 pub(crate) fn write_method(target: &Value, vm: &mut VM<'_>) -> RunResult<Option<Value>> {
-    if is_file(target, vm) {
+    if is_native_stream(target, vm.heap) {
         return Ok(Some(Value::None));
     }
     let name = EitherStr::Interned(vm.interns.intern_static(StaticStrings::Write));
@@ -158,15 +160,16 @@ pub(super) fn writerows<'h>(obj: &HeapRead<'h, CsvObject>, args: ArgValues, vm: 
             defer_drop!(row, vm);
             let items = row_items(row, vm)?;
             defer_drop!(items, vm);
-            writerow_now(write, &dialect, &terminator_chars, items, &mut line, vm)?;
+            writerow_now(target, write, &dialect, &terminator_chars, items, &mut line, vm)?;
         }
         Ok(CallResult::Value(Value::None))
     }
 }
 
-/// Formats `items` through `line` and runs the bound `write` to completion; the per-row step
+/// Formats `items` through `line` and runs the target's `write` to completion; the per-row step
 /// of `writerows` and `DictWriter.writerows` on a target that is not a file.
 pub(super) fn writerow_now(
+    target: &Value,
     write: &Value,
     dialect: &Dialect,
     terminator_chars: &[char],
@@ -175,7 +178,14 @@ pub(super) fn writerow_now(
     vm: &mut VM<'_>,
 ) -> RunResult<()> {
     let line = format_items(dialect, terminator_chars, items, line, vm)?;
-    vm.evaluate_function(write, ArgValues::One(line))?.drop_with(vm);
+    let written = if is_memory_stream(target, vm.heap) {
+        let name = vm.interns.intern_static(StaticStrings::Write);
+        vm.call_attr(target.clone_with_heap(vm.heap), name, ArgValues::One(line))?
+            .require_synchronous(vm)?
+    } else {
+        vm.evaluate_function(write, ArgValues::One(line))?
+    };
+    written.drop_with(vm);
     Ok(())
 }
 
@@ -397,39 +407,34 @@ fn is_file(value: &Value, vm: &VM<'_>) -> bool {
     matches!(value, Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::OpenFile(_)))
 }
 
-/// The fields of one row, as `writerow`'s `iter(row)` sees them: a non-iterable row is
-/// `_csv.Error`, unlike `writerows`' plain `TypeError`. A `list` or `tuple`, the usual row,
-/// is copied without an iterator.
+/// Copies the row before field formatting can call Python. A non-iterable row raises `_csv.Error`.
 fn row_items(row: &Value, vm: &mut VM<'_>) -> RunResult<Vec<Value>> {
-    let direct = match row {
-        Value::Ref(id) => match vm.heap.get(*id) {
-            HeapData::List(list) => Some(list.as_slice()),
-            HeapData::Tuple(tuple) => Some(tuple.as_slice()),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(items) = direct {
-        vm.heap.tracker.check_allocation(items.len() * VALUE_SIZE)?;
-        Ok(items.iter().map(|item| item.clone_with_heap(vm.heap)).collect())
-    } else {
-        let iterator = match row.py_iter(vm).and_then(|call| call.require_synchronous(vm)) {
-            Ok(iterator) => iterator,
-            Err(err) if err.is_catchable(ExcType::TypeError) => {
-                return Err(ExcType::csv_error(format!(
-                    "iterable expected, not {}",
-                    row.py_type_name(vm)
-                )));
-            }
-            Err(err) => return Err(err),
-        };
-        collect_owned_iterable(iterator, vm)
+    let mut fields = DropGuard::new(Vec::new(), vm);
+    let (output, vm) = fields.as_parts_mut();
+    if let Some(items) = SequenceItems::from_value(row, vm.heap) {
+        vm.heap
+            .tracker
+            .check_allocation(items.len().saturating_mul(VALUE_SIZE))?;
+        output.reserve_exact(items.len());
+        items.extend_cloned(output, vm.heap)?;
+        return Ok(fields.into_inner());
     }
+    let iterator = match row.py_iter(vm).and_then(|call| call.require_synchronous(vm)) {
+        Ok(iterator) => iterator,
+        Err(err) if err.is_catchable(ExcType::TypeError) => {
+            return Err(ExcType::csv_error(format!(
+                "iterable expected, not {}",
+                row.py_type_name(vm)
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    collect_owned_iterable(iterator, vm)
 }
 
-/// `write(line)`: the host call of a file target, otherwise the bound `write`.
+/// `write(line)`: called by name on a file or io stream target, otherwise the bound `write`.
 fn write_line(target: &Value, write: &Value, line: Value, vm: &mut VM<'_>) -> RunResult<CallResult> {
-    if is_file(target, vm) {
+    if is_native_stream(target, vm.heap) {
         let name = vm.interns.intern_static(StaticStrings::Write);
         vm.call_attr(target.clone_with_heap(vm.heap), name, ArgValues::One(line))
     } else {

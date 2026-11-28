@@ -11,12 +11,15 @@ use monty_types::ExcType;
 use crate::{
     annotations,
     args::ArgValues,
-    asyncio::{Awaiter, Coroutine, ExternalFuture, ExternalFutureState, GatherFuture, GatherState},
+    asyncio::{
+        Awaiter, Coroutine, ExternalFuture, ExternalFutureState, GatherFuture, GatherState, TaskFuture,
+        TaskFutureState, WaitFuture, WaitFutureState,
+    },
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_private::{ExcTypeExt, RunResult, SimpleException},
+    exception_private::{ExcTypeExt, ExceptionValue, RunResult},
     hash::HashValue,
-    heap::{HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
+    heap::{HeapId, HeapItem, HeapObjectRead},
     intern::FunctionId,
     types::{LazyHeapSet, LongInt, PyTrait, Type, TypeRef},
     value::{EitherStr, Value},
@@ -75,7 +78,7 @@ macro_rules! heap_payloads {
             Slice(inline $crate::types::Slice),
             /// An exception instance such as `ValueError('message')`.
             #[serde(rename = "X")]
-            Exception(inline $crate::exception_private::SimpleException),
+            Exception(inline $crate::exception_private::ExceptionValue),
             /// A host-backed class instance (the heap form of the wire `ClassInstance`).
             HostClass(boxed $crate::types::HostClass),
             /// The lightweight type object `type(x)` materializes for a `HostClass`
@@ -88,6 +91,8 @@ macro_rules! heap_payloads {
             /// An instance of a user-defined class.
             #[serde(rename = "I")]
             Instance(boxed $crate::types::Instance),
+            /// A builtin property, classmethod or staticmethod.
+            BuiltinDescriptor(boxed $crate::types::BuiltinDescriptor),
             /// A method bound to an instance.
             #[serde(rename = "M")]
             BoundMethod(inline $crate::types::BoundMethod),
@@ -120,6 +125,10 @@ macro_rules! heap_payloads {
             SetIterator(inline $crate::types::SetIterator),
             /// A `callable_iterator` object from `iter(callable, sentinel)`.
             CallableIterator(inline $crate::types::callable_iterator::CallableIterator),
+            /// A lazy `map` or `filter`, retaining its callback and source iterators.
+            MapFilter(boxed $crate::types::map_filter::MapFilter),
+            /// A generator object, holding its paused frame between yields.
+            Generator(boxed $crate::bytecode::Generator),
             /// An arbitrary-precision integer used when a Python `int` does not fit in `i64`.
             #[serde(rename = "G")]
             LongInt(inline $crate::types::LongInt),
@@ -135,10 +144,18 @@ macro_rules! heap_payloads {
             GatherFuture(boxed $crate::asyncio::GatherFuture),
             /// An external future driven by the host.
             ExternalFuture(boxed $crate::asyncio::ExternalFuture),
+            /// A Python-visible `asyncio.Task` handle and completion record.
+            Task(boxed $crate::asyncio::TaskFuture),
+            /// An `asyncio.wait()` result tracking its inputs to completion.
+            WaitFuture(boxed $crate::asyncio::WaitFuture),
             /// A filesystem path from `pathlib.Path`.
             Path(inline $crate::types::Path),
             /// A path-backed file object returned by `open()`.
             OpenFile(boxed $crate::types::OpenFile),
+            /// An `io.StringIO` in-memory text stream.
+            StringIo(boxed $crate::types::io::StringIo),
+            /// An `io.BytesIO` in-memory binary stream.
+            BytesIo(boxed $crate::types::io::BytesIo),
             /// A compiled regular-expression pattern.
             RePattern(boxed $crate::types::RePattern),
             /// A regular-expression match result.
@@ -225,8 +242,8 @@ impl HeapData {
     /// Returns whether this heap data type can participate in reference cycles.
     ///
     /// Only container types that can hold references to other heap objects need to be
-    /// tracked for GC purposes. Leaf types like Str, Bytes, Range, and Exception cannot
-    /// form cycles and should not count toward the GC allocation threshold.
+    /// tracked for GC purposes. Leaf types like Str, Bytes, Range, and most exceptions
+    /// cannot form cycles and should not count toward the GC allocation threshold.
     ///
     /// This optimization allows programs that allocate many leaf objects (like strings)
     /// to avoid triggering unnecessary GC cycles.
@@ -235,6 +252,8 @@ impl HeapData {
     #[inline]
     pub(crate) fn is_gc_tracked(&self) -> bool {
         match self {
+            // Tracked only when it owns a `StopIteration` value; a chained exception that owns one is tracked itself.
+            Self::Exception(exception) => exception.value.is_some(),
             Self::Itertools(iter) => iter.is_gc_tracked(),
             Self::DirScan(scan) => scan.is_gc_tracked(),
             Self::List(_)
@@ -255,6 +274,7 @@ impl HeapData {
             | Self::HostClassType(_)
             | Self::Class(_)
             | Self::Instance(_)
+            | Self::BuiltinDescriptor(_)
             | Self::BoundMethod(_)
             | Self::DataclassField(_)
             | Self::DataclassMethod(_)
@@ -266,10 +286,14 @@ impl HeapData {
             | Self::DictValueIterator(_)
             | Self::SetIterator(_)
             | Self::CallableIterator(_)
+            | Self::MapFilter(_)
+            | Self::Generator(_)
             | Self::Module(_)
             | Self::Coroutine(_)
             | Self::GatherFuture(_)
             | Self::ExternalFuture(_)
+            | Self::Task(_)
+            | Self::WaitFuture(_)
             | Self::Partial(_)
             | Self::GenericAlias(_)
             | Self::Union(_)
@@ -282,7 +306,6 @@ impl HeapData {
             | Self::Bytes(_)
             | Self::Range(_)
             | Self::Slice(_)
-            | Self::Exception(_)
             | Self::DataclassParams(_)
             | Self::StringIterator(_)
             | Self::BytesIterator(_)
@@ -291,6 +314,8 @@ impl HeapData {
             | Self::Complex(_)
             | Self::Path(_)
             | Self::OpenFile(_)
+            | Self::StringIo(_)
+            | Self::BytesIo(_)
             | Self::RePattern(_)
             | Self::ReMatch(_)
             | Self::ExtFunction(_)
@@ -318,6 +343,9 @@ impl HeapData {
     /// so it is not simply the list of `py_call` overrides.
     #[must_use]
     pub(crate) fn is_callable(&self) -> bool {
+        if let Self::BuiltinDescriptor(d) = self {
+            return d.kind() == Type::StaticMethod;
+        }
         matches!(
             self,
             Self::Class(_)
@@ -369,6 +397,7 @@ impl HeapData {
             Self::Instance(instance) => return TypeRef::Class(instance.class()),
             // A class object's type is `type`.
             Self::HostClassType(_) | Self::Class(_) => Type::Type,
+            Self::BuiltinDescriptor(d) => d.kind(),
             Self::BoundMethod(_) => Type::Function,
             Self::DataclassField(_) => Type::DataclassField,
             Self::DataclassMethod(_) => Type::Function,
@@ -377,8 +406,12 @@ impl HeapData {
             Self::Complex(_) => Type::Complex,
             Self::Module(_) => Type::Module,
             Self::Coroutine(_) | Self::GatherFuture(_) | Self::ExternalFuture(_) => Type::Coroutine,
+            Self::Task(_) => Type::Task,
+            Self::WaitFuture(_) => Type::Coroutine,
             Self::Path(_) => Type::Path,
             Self::OpenFile(file) => file.file_type(),
+            Self::StringIo(_) => Type::StringIo,
+            Self::BytesIo(_) => Type::BytesIo,
             Self::RePattern(_) => Type::RePattern,
             Self::ReMatch(_) => Type::ReMatch,
             Self::Date(_) => Type::Date,
@@ -397,6 +430,8 @@ impl HeapData {
             Self::DictValueIterator(_) => Type::DictValueIterator,
             Self::SetIterator(_) => Type::SetIterator,
             Self::CallableIterator(_) => Type::CallableIterator,
+            Self::MapFilter(iter) => iter.py_type(),
+            Self::Generator(_) => Type::WalkGenerator,
             Self::Itertools(i) => i.py_type(),
             Self::DirScan(scan) => scan.py_type(),
             Self::Csv(csv) => csv.py_type(),
@@ -527,8 +562,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Closure> {
     /// Two closures over the same `def` are equal only if they captured the
     /// same cells; the defaults play no part, as in CPython.
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(match other.read_heap(vm) {
-            Some(HeapReadOutput::Closure(other)) => {
+        Ok(match other.read_as::<Closure>(vm.heap) {
+            Some(other) => {
                 let this = self.get(vm.heap);
                 let other = other.get(vm.heap);
                 Some(this.func_id == other.func_id && this.cells == other.cells)
@@ -584,10 +619,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, FunctionDefaults> {
     /// Equal when they decorate the same `def`: with no captured scope, the
     /// defaults are all that could differ and CPython ignores those too.
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(match other.read_heap(vm) {
-            Some(HeapReadOutput::FunctionDefaults(other)) => {
-                Some(self.get(vm.heap).func_id == other.get(vm.heap).func_id)
-            }
+        Ok(match other.read_as::<FunctionDefaults>(vm.heap) {
+            Some(other) => Some(self.get(vm.heap).func_id == other.get(vm.heap).func_id),
             _ => None,
         })
     }
@@ -633,11 +666,13 @@ fn hash_func_id(func_id: FunctionId) -> HashValue {
     HashValue::new(hasher.finish())
 }
 
-impl HeapItem for SimpleException {
+impl HeapItem for ExceptionValue {
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        // Only the chain holds references; they are always exceptions, so an
-        // exception still cannot reach a container and stays a GC leaf.
+        // The chain only holds exceptions; a `StopIteration` value can be anything.
         stack.extend(self.owned_chain_ids());
+        if let Some(value) = &mut self.value {
+            value.py_dec_ref_ids(stack);
+        }
     }
 }
 
@@ -668,9 +703,7 @@ impl HeapItem for GatherFuture {
         // completed successfully. `Pending` and `Failed` carry no heap refs.
         match &mut self.state {
             GatherState::Awaited(awaited) => {
-                if let Awaiter::GatherSlot { gather, .. } = &awaited.awaiter {
-                    stack.push(*gather);
-                }
+                stack.extend(awaited.awaiter.heap_ref());
                 for result in awaited.results.iter_mut().flatten() {
                     result.py_dec_ref_ids(stack);
                 }
@@ -683,23 +716,50 @@ impl HeapItem for GatherFuture {
 
 impl HeapItem for ExternalFuture {
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        // `Pending { awaiter: Some(Awaiter::GatherSlot { gather, .. }) }`
-        // owns an inc_ref on `gather` — release it when this entry is
-        // freed. `Awaiter::Task` and `None` own nothing. `Resolved` owns
-        // the cached value; `Failed` carries no heap refs. A pending sleep
-        // result is owned until resolution takes it.
+        // A pending awaiter owns the reference reported by
+        // `Awaiter::heap_ref` (a gather, wait future or task) — release it
+        // when this entry is freed. `Awaiter::Task` and `None` own nothing.
+        // `Resolved` owns the cached value; `Failed` carries no heap refs. A
+        // pending sleep result is owned until resolution takes it.
         if let Some(result) = &mut self.sleep_result {
             result.py_dec_ref_ids(stack);
         }
         match &mut self.state {
             ExternalFutureState::Resolved(value) => value.py_dec_ref_ids(stack),
-            ExternalFutureState::Pending {
-                awaiter: Some(Awaiter::GatherSlot { gather, .. }),
-            } => stack.push(*gather),
-            ExternalFutureState::Pending {
-                awaiter: None | Some(Awaiter::Task(_)),
+            ExternalFutureState::Pending { awaiter: Some(awaiter) } => {
+                stack.extend(awaiter.heap_ref());
             }
-            | ExternalFutureState::Failed(_) => {}
+            ExternalFutureState::Pending { awaiter: None } | ExternalFutureState::Failed(_) => {}
+        }
+    }
+}
+
+impl HeapItem for TaskFuture {
+    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        stack.push(self.coroutine_id);
+        stack.extend(self.awaiters.iter().filter_map(Awaiter::heap_ref));
+        if let TaskFutureState::Completed(value) = &mut self.state {
+            value.py_dec_ref_ids(stack);
+        }
+    }
+}
+
+impl HeapItem for WaitFuture {
+    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        match &mut self.state {
+            WaitFutureState::Unawaited(wait) => {
+                wait.fs.py_dec_ref_ids(stack);
+                if let Some(return_when) = &mut wait.return_when {
+                    return_when.py_dec_ref_ids(stack);
+                }
+                stack.extend(wait.timer);
+            }
+            WaitFutureState::Pending(wait) => {
+                stack.extend(wait.inputs.iter().copied());
+                stack.extend(wait.awaiter.as_ref().and_then(Awaiter::heap_ref));
+                stack.extend(wait.timer);
+            }
+            WaitFutureState::Consumed => {}
         }
     }
 }

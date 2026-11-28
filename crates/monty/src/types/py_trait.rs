@@ -42,14 +42,8 @@ pub(crate) enum CmpOrder {
 }
 
 impl CmpOrder {
-    /// Maps an `Option<Ordering>` from a numeric comparison helper, where `None`
-    /// can *only* mean a `NaN` operand (`f64::partial_cmp`, `i64_cmp_f64`,
-    /// `bigint_cmp_f64`, and `LongInt::partial_cmp_f64` all return `None`
-    /// exclusively for `NaN`). `None` therefore becomes [`Unordered`], never
-    /// [`Incomparable`].
-    ///
-    /// [`Unordered`]: Self::Unordered
-    /// [`Incomparable`]: Self::Incomparable
+    /// Numeric comparisons such as [`bigint_cmp_f64`](super::long_int::bigint_cmp_f64)
+    /// return `None` for NaN. Map that case to [`Self::Unordered`].
     pub(crate) fn from_numeric(ordering: Option<Ordering>) -> Self {
         match ordering {
             Some(ordering) => Self::Ordered(ordering),
@@ -728,9 +722,10 @@ pub(crate) trait PyTrait<'h>: PyObjectIdentity {
         Err(ExcType::type_error_not_iterable(&self.py_type_name(vm)))
     }
 
-    /// Advances an iterator synchronously for Rust consumers.
-    /// Public `next()` dispatches user methods separately so they can suspend.
-    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    /// Advances once. Native exhaustion returns `None`; a call may instead raise `StopIteration`.
+    /// VM callers dispatch the returned call. Synchronous consumers use [`ValueRead::py_next`](crate::value::ValueRead::py_next)
+    /// or [`PyValue::next_sync`](crate::py_value::PyValue::next_sync) to finish it and translate exhaustion to `None`.
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
         Err(ExcType::type_error_not_iterator(&self.py_type_name(vm)))
     }
 }

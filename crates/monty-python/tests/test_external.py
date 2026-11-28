@@ -1,3 +1,4 @@
+import asyncio
 import binascii
 import datetime
 import io
@@ -441,6 +442,7 @@ def test_external_function_json_decode_error_missing_attributes(monty_run: RunMo
         (ModuleNotFoundError, 'ModuleNotFoundError'),
         # OSError hierarchy
         (TimeoutError, 'TimeoutError'),
+        (BlockingIOError, 'BlockingIOError'),
         (FileNotFoundError, 'FileNotFoundError'),
         (OSError, 'OSError'),
         # Other exceptions
@@ -454,6 +456,7 @@ def test_external_function_json_decode_error_missing_attributes(monty_run: RunMo
         (binascii.Error, 'binascii.Error'),
         (binascii.Incomplete, 'binascii.Incomplete'),
         (statistics.StatisticsError, 'statistics.StatisticsError'),
+        (asyncio.InvalidStateError, 'asyncio.exceptions.InvalidStateError'),
     ],
 )
 def test_external_function_exception_hierarchy(
@@ -486,6 +489,7 @@ def test_external_function_exception_hierarchy(
         (ModuleNotFoundError, ImportError, 'child'),
         # OSError hierarchy (TimeoutError is a subclass since Python 3.3)
         (TimeoutError, OSError, 'child'),
+        (BlockingIOError, OSError, 'child'),
     ],
 )
 def test_external_function_exception_caught_by_parent(
@@ -551,6 +555,7 @@ caught
         (json.JSONDecodeError, 'json.JSONDecodeError', ValueError),
         (re.error, 're.PatternError', Exception),
         (statistics.StatisticsError, 'statistics.StatisticsError', ValueError),
+        (asyncio.InvalidStateError, 'asyncio.InvalidStateError', Exception),
     ],
 )
 def test_external_function_dotted_exception_caught_by_own_name(

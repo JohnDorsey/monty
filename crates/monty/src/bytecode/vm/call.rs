@@ -29,7 +29,7 @@ use crate::{
     py_value::PyValue,
     resource_checks::check_estimated_size,
     types::{
-        Dict, Instance, PyTrait, Type, TypeRef,
+        Dict, Instance, PyTrait, Tuple, Type, TypeRef, descriptor,
         instance::{class_defines, class_lookup},
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -49,6 +49,8 @@ pub(crate) enum CallResult {
     /// A defined function became the VM's current frame.
     /// Propagate or require synchronous completion; dropping this result does not pop the frame.
     FramePushed,
+    /// A private continuation finished by restoring its caller without delivering an operand.
+    CallerRestored,
     /// External function call requested - VM should pause and return to caller.
     External {
         /// The external function's name (interned or heap-owned).
@@ -117,6 +119,12 @@ pub(crate) enum CallResult {
     },
 }
 
+impl From<Value> for CallResult {
+    fn from(value: Value) -> Self {
+        Self::Value(value)
+    }
+}
+
 impl CallResult {
     /// Completes a call at a Rust boundary that cannot yield to the host.
     /// Python frames still run; unsupported suspensions are raised inside them and cleaned up.
@@ -180,7 +188,7 @@ impl<C: ContainsHeap> DropWithContext<C> for CallResult {
             }
             Self::OsCall(call) => call.drop_with(heap),
             Self::AttrLookup { effect, .. } => effect.drop_with(heap),
-            Self::FramePushed => {}
+            Self::FramePushed | Self::CallerRestored => {}
             Self::OsCallWithEffect { call, effect } => {
                 call.drop_with(heap);
                 // Discarded before it ever became a `FrameExit`.
@@ -462,7 +470,7 @@ impl<'h> VM<'h> {
 
     /// Converts a direct call suspension into a specific synchronous-context error.
     #[cold]
-    fn unsupported_call_result(&mut self, result: CallResult) -> RunError {
+    pub(super) fn unsupported_call_result(&mut self, result: CallResult) -> RunError {
         let error = match &result {
             CallResult::External {
                 name: function_name, ..
@@ -492,7 +500,9 @@ impl<'h> VM<'h> {
                 return error;
             }
             CallResult::AwaitValue(_) => ExcType::not_implemented("cannot await a value in this synchronous context"),
-            CallResult::Value(_) | CallResult::FramePushed => unreachable!("completed calls are handled above"),
+            CallResult::Value(_) | CallResult::FramePushed | CallResult::CallerRestored => {
+                unreachable!("completed calls are handled above")
+            }
         };
         result.drop_with(self);
         error.into()
@@ -651,10 +661,7 @@ impl<'h> VM<'h> {
     /// Panics if `args_tuple` is not a tuple. This indicates a compiler bug since
     /// the compiler always emits `ListToTuple` before `CallFunctionExtended`.
     fn extract_args_tuple(&mut self, args_tuple: &Value) -> RunResult<Vec<Value>> {
-        let Value::Ref(id) = args_tuple else {
-            unreachable!("CallFunctionExtended: args_tuple must be a Ref")
-        };
-        let HeapData::Tuple(tuple) = self.heap.get(*id) else {
+        let Some(tuple) = args_tuple.get_as::<Tuple>(self.heap) else {
             unreachable!("CallFunctionExtended: args_tuple must be a Tuple")
         };
         clone_args_from_tuple(tuple.as_slice(), self)
@@ -670,10 +677,7 @@ impl<'h> VM<'h> {
         defer_drop!(kwargs_ref, this);
 
         // Extract kwargs dict items
-        let Value::Ref(id) = kwargs_ref else {
-            unreachable!("CallFunctionExtended: kwargs must be a Ref")
-        };
-        let HeapData::Dict(dict) = this.heap.get(*id) else {
+        let Some(dict) = kwargs_ref.get_as::<Dict>(this.heap) else {
             unreachable!("CallFunctionExtended: kwargs must be a Dict")
         };
         let copied_kwargs: Vec<(Value, Value)> = dict
@@ -718,10 +722,7 @@ impl<'h> VM<'h> {
     /// Panics if `args_tuple` is not a tuple. This indicates a compiler bug since
     /// the compiler always emits `ListToTuple` before `CallAttrExtended`.
     fn extract_args_tuple_for_attr(&mut self, args_tuple: &Value) -> RunResult<Vec<Value>> {
-        let Value::Ref(id) = args_tuple else {
-            unreachable!("CallAttrExtended: args_tuple must be a Ref")
-        };
-        let HeapData::Tuple(tuple) = self.heap.get(*id) else {
+        let Some(tuple) = args_tuple.get_as::<Tuple>(self.heap) else {
             unreachable!("CallAttrExtended: args_tuple must be a Tuple")
         };
         clone_args_from_tuple(tuple.as_slice(), self)
@@ -741,10 +742,7 @@ impl<'h> VM<'h> {
         defer_drop!(kwargs_ref, this);
 
         // Extract kwargs dict items
-        let Value::Ref(id) = kwargs_ref else {
-            unreachable!("CallAttrExtended: kwargs must be a Ref")
-        };
-        let HeapData::Dict(dict) = this.heap.get(*id) else {
+        let Some(dict) = kwargs_ref.get_as::<Dict>(this.heap) else {
             unreachable!("CallAttrExtended: kwargs must be a Dict")
         };
         let copied_kwargs: Vec<(Value, Value)> = dict
@@ -834,12 +832,11 @@ impl<'h> VM<'h> {
         debug_assert_exact_callable(&callable, func_id);
 
         let coroutine = Coroutine::new(func_id, namespace, None);
-        let coroutine_id = self.heap.allocate(HeapData::Coroutine(coroutine));
-        CallResult::Value(Value::Ref(coroutine_id))
+        CallResult::Value(Value::allocate(coroutine, self.heap))
     }
 
     /// Calls an internal function, compiling it on first use.
-    /// Arguments transfer into ordinary frame locals; implementation frames do not charge recursion depth.
+    /// Implementation frames use a separate depth cap rather than the user's Python recursion budget.
     pub(crate) fn call_frozen_exact<const N: usize>(
         &mut self,
         function: FrozenFunction,
@@ -848,17 +845,8 @@ impl<'h> VM<'h> {
         let mut args_guard = DropGuard::new(args, self);
         let (_, vm) = args_guard.as_parts_mut();
         let interns = vm.interns;
-        let (function_id, overlay) = if let Some(id) = interns.frozen_function(function) {
-            (id, None)
-        } else {
-            let (id, overlay) = function.compile(interns)?;
-            (id, Some(overlay))
-        };
-        // No fallible operation or Python execution may intervene between publication and frame installation.
-        if let Some(overlay) = overlay {
-            overlay.commit();
-            interns.set_frozen_function(function, function_id);
-        }
+        let function_id = function.resolve(interns)?;
+        vm.enter_frozen_frame()?;
         let (args, vm) = args_guard.into_parts();
         let func = interns.get_function(function_id);
         assert_eq!(func.signature.exact_positional_count(), Some(N));
@@ -883,14 +871,14 @@ impl<'h> VM<'h> {
         Ok(CallResult::FramePushed)
     }
 
-    /// Calls a defined function by pushing a new frame or creating a coroutine.
+    /// Calls a defined function by pushing a new frame or creating a coroutine or generator.
     ///
     /// For sync functions: sets up the function's namespace with bound arguments,
     /// cell variables, and free variables, then pushes a new frame.
     ///
-    /// For async functions: binds arguments immediately but returns a Coroutine
-    /// instead of pushing a frame. The coroutine stores the pre-bound namespace
-    /// and will be executed when awaited.
+    /// For async and generator functions: binds arguments immediately but returns a
+    /// Coroutine or Generator instead of pushing a frame. It stores the pre-bound
+    /// namespace and runs it when awaited or advanced.
     pub(crate) fn call_def_function(
         &mut self,
         func_id: FunctionId,
@@ -901,7 +889,9 @@ impl<'h> VM<'h> {
     ) -> Result<CallResult, RunError> {
         let func = self.interns.get_function(func_id);
 
-        if func.is_async {
+        if func.is_generator {
+            self.call_generator_function(func_id, func, cells, defaults, globals, args)
+        } else if func.is_async {
             self.create_coroutine(func_id, func, cells, defaults, globals, args)
         } else {
             let namespace = function_namespace(globals, &*self.heap);
@@ -911,7 +901,7 @@ impl<'h> VM<'h> {
 
     /// Calls an `__annotate__` function with `format` (PEP 649).
     ///
-    /// A `def` runs under [`FrameNamespace::Annotate`]: names resolve through
+    /// A regular `def` runs under [`FrameNamespace::Annotate`]: names resolve through
     /// `classdict` (a borrowed class-namespace copy, for a class's annotations),
     /// then its globals, with `missing` standing in for CPython's "fake globals"
     /// in `FORWARDREF` and `STRING` format. Any other callable runs plainly.
@@ -938,9 +928,9 @@ impl<'h> VM<'h> {
             return this.call_function(annotate, args);
         };
         let func = this.interns.get_function(func_id);
-        if func.is_async {
+        if func.is_async || func.is_generator {
             defer_drop!(defaults, this);
-            return this.create_coroutine(func_id, func, &cells, defaults, globals, args);
+            return this.call_def_function(func_id, &cells, defaults, globals, args);
         }
         let (missing, this) = missing_guard.into_parts();
         defer_drop!(defaults, this);
@@ -1020,10 +1010,30 @@ impl<'h> VM<'h> {
         if let Some(globals) = globals {
             this.heap.inc_ref(globals);
         }
-        let coroutine = Coroutine::new(func_id, namespace, globals);
-        let coroutine_id = this.heap.allocate(HeapData::Coroutine(coroutine));
+        Ok(CallResult::Value(Value::allocate(
+            Coroutine::new(func_id, namespace, globals),
+            this.heap,
+        )))
+    }
 
-        Ok(CallResult::Value(Value::Ref(coroutine_id)))
+    /// Binds a generator function's arguments into a new [`Generator`](super::Generator).
+    ///
+    /// Argument errors are raised here, at the call, before any of the body runs.
+    fn call_generator_function(
+        &mut self,
+        func_id: FunctionId,
+        func: &Function,
+        cells: &[HeapId],
+        defaults: &[Value],
+        globals: Option<HeapId>,
+        args: ArgValues,
+    ) -> Result<CallResult, RunError> {
+        let mut locals_guard = DropGuard::new(Vec::with_capacity(func.namespace_size), self);
+        let (locals, this) = locals_guard.as_parts_mut();
+        func.signature.bind(args, defaults, this, func.name, locals)?;
+        this.install_closure_cells(func, cells, locals);
+        let (locals, this) = locals_guard.into_parts();
+        Ok(CallResult::Value(this.create_generator(func_id, locals, globals)))
     }
 
     /// Installs owned cell variables and captured free-var cells into a frame's
@@ -1052,8 +1062,7 @@ impl<'h> VM<'h> {
                 Some(param_idx) => namespace[param_idx].clone_with_heap(self),
                 None => Value::Undefined,
             };
-            let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)));
-            namespace[slot.index()] = Value::Ref(cell_id);
+            namespace[slot.index()] = Value::allocate(CellValue(cell_value), self.heap);
         }
 
         for (i, &cell_id) in cells.iter().enumerate() {
@@ -1226,6 +1235,16 @@ impl<'h> VM<'h> {
             Some(init_func) => {
                 let this = self;
                 defer_drop!(init_func, this);
+                if descriptor::has_get(init_func, this) {
+                    this.push(Value::Ref(instance_id));
+                    match descriptor::call_member(init_func, instance_id, args, this)? {
+                        CallResult::FramePushed => {
+                            this.current_frame_mut().is_initializer = true;
+                            return Ok(CallResult::FramePushed);
+                        }
+                        _ => unreachable!("descriptor call installs a continuation"),
+                    }
+                }
                 // CPython's `type.__call__` looks up `__init__` with descriptor
                 // binding: only plain functions bind the new instance as `self`.
                 // Bound methods already carry their own receiver, and builtins,
@@ -1295,15 +1314,20 @@ impl<'h> VM<'h> {
 
     /// Whether calling `value` would push a regular synchronous frame
     /// (`CallResult::FramePushed`): a plain `def`, closure, function-with-defaults,
-    /// or a bound method wrapping one — but not an `async def`, whose call creates
-    /// a coroutine instead. Used by [`instantiate_class`](Self::instantiate_class)
-    /// to decide whether `__init__` can run as a suspendable initializer frame.
+    /// or a bound method wrapping one — but not an `async def` or generator
+    /// function, whose call creates a coroutine or generator instead. Used by
+    /// [`instantiate_class`](Self::instantiate_class) to decide whether `__init__`
+    /// can run as a suspendable initializer frame.
     fn is_plain_sync_function(&self, value: &Value) -> bool {
+        let pushes_frame = |func_id| {
+            let func = self.interns.get_function(func_id);
+            !func.is_async && !func.is_generator
+        };
         match value {
-            Value::DefFunction(func_id) => !self.interns.get_function(*func_id).is_async,
+            Value::DefFunction(func_id) => pushes_frame(*func_id),
             Value::Ref(id) => match self.heap.get(*id) {
-                HeapData::Closure(closure) => !self.interns.get_function(closure.func_id).is_async,
-                HeapData::FunctionDefaults(fd) => !self.interns.get_function(fd.func_id).is_async,
+                HeapData::Closure(closure) => pushes_frame(closure.func_id),
+                HeapData::FunctionDefaults(fd) => pushes_frame(fd.func_id),
                 // Bound methods never wrap another bound method, so this
                 // recursion is at most one level deep.
                 HeapData::BoundMethod(bm) => self.is_plain_sync_function(&bm.func),

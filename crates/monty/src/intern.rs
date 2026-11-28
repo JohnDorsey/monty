@@ -21,15 +21,17 @@ mod compile;
 mod storage;
 
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     collections::BTreeMap,
     mem,
+    num::NonZeroU32,
     slice::from_ref,
     str::FromStr,
     sync::{Arc, LazyLock},
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 pub(crate) use compile::CompileInterns;
 use num_bigint::BigInt;
 use storage::Entries;
@@ -552,6 +554,8 @@ pub enum StaticStrings {
     A85Encode,
     /// `sys.abiflags` attribute.
     Abiflags,
+    /// `Context.abs()`.
+    Abs,
     /// Kwarg name `abs_tol` — `math.isclose(abs_tol=...)`.
     AbsTol,
     /// `Path.absolute()` method — yields a host call.
@@ -566,6 +570,8 @@ pub enum StaticStrings {
     Acosh,
     /// `set.add()` method.
     Add,
+    /// `Decimal.adjusted()`.
+    Adjusted,
     /// `adobe` parameter of `base64.a85encode()` / `a85decode()`.
     #[strum(serialize = "adobe")]
     Adobe,
@@ -573,6 +579,9 @@ pub enum StaticStrings {
     AlgorithmsAvailable,
     /// `hashlib.algorithms_guaranteed`.
     AlgorithmsGuaranteed,
+    /// `asyncio.ALL_COMPLETED`.
+    #[strum(serialize = "ALL_COMPLETED")]
+    AllCompleted,
     /// `json.dumps(allow_nan=...)` keyword.
     #[strum(serialize = "allow_nan")]
     AllowNan,
@@ -585,6 +594,8 @@ pub enum StaticStrings {
     Altsep,
     /// `time.altzone` constant.
     Altzone,
+    /// `Path.anchor` property.
+    Anchor,
     /// `typing.Annotated` marker.
     #[strum(serialize = "Annotated")]
     Annotated,
@@ -609,17 +620,25 @@ pub enum StaticStrings {
     Args,
     /// `sys.argv` attribute.
     Argv,
+    /// `as_integer_ratio()` method on `int`, `float`, and `Decimal`.
+    AsIntegerRatio,
     /// `Path.as_posix()` method, answered without host I/O.
     AsPosix,
     /// `re.ASCII` flag
     #[strum(serialize = "ASCII")]
     AsciiFlag,
+    /// `Decimal.as_tuple()`.
+    AsTuple,
     /// `time.asctime()` function.
     Asctime,
     /// `math.asin()` function.
     Asin,
     /// `math.asinh()` function.
     Asinh,
+    /// `typing.assert_never()` function.
+    AssertNever,
+    /// `typing.assert_type()` function.
+    AssertType,
     /// `datetime.astimezone()` method.
     Astimezone,
     /// Module name for `import asyncio`.
@@ -716,12 +735,27 @@ pub enum StaticStrings {
     Blake2s,
     /// `block_size` attribute of a hash object.
     BlockSize,
+    /// `BlockingIOError`, a builtin also exported by `io`.
+    #[strum(serialize = "BlockingIOError")]
+    BlockingIoError,
+    /// `io.BufferedRandom` file class.
+    #[strum(serialize = "BufferedRandom")]
+    BufferedRandom,
+    /// `io.BufferedReader` file class.
+    #[strum(serialize = "BufferedReader")]
+    BufferedReader,
+    /// `io.BufferedWriter` file class.
+    #[strum(serialize = "BufferedWriter")]
+    BufferedWriter,
     /// Kwarg name `buffering` — `open(buffering=...)`.
     Buffering,
     /// `sys.builtin_module_names` attribute.
     BuiltinModuleNames,
     /// `sys.byteorder` attribute.
     Byteorder,
+    /// `io.BytesIO` in-memory binary stream.
+    #[strum(serialize = "BytesIO")]
+    BytesIo,
     /// `bytes_per_sep` parameter of `binascii.hexlify()`.
     #[strum(serialize = "bytes_per_sep")]
     BytesPerSep,
@@ -741,6 +775,12 @@ pub enum StaticStrings {
     /// `typing.Callable` marker.
     #[strum(serialize = "Callable")]
     Callable,
+    /// `asyncio.Task.cancel()` method.
+    Cancel,
+    /// `asyncio.Task.cancelled()` method.
+    Cancelled,
+    /// `Decimal.canonical()` / `Context.canonical()`.
+    Canonical,
     /// `capitalize()` method, shared by `str` and `bytes`.
     Capitalize,
     /// Kwarg name `capitals` — `decimal.Context()`.
@@ -749,6 +789,8 @@ pub enum StaticStrings {
     CaseSensitive,
     /// `str.casefold()` method.
     Casefold,
+    /// `typing.cast()` function.
+    Cast,
     /// `unicodedata.category()` function.
     Category,
     /// `math.cbrt()` function.
@@ -778,6 +820,10 @@ pub enum StaticStrings {
     ClassVar,
     /// `clear()` method, shared by `list`, `dict` and `set`.
     Clear,
+    /// `Context.clear_flags()`.
+    ClearFlags,
+    /// `Context.clear_traps()`.
+    ClearTraps,
     /// `file.close()` method.
     Close,
     /// `file.closed` attribute.
@@ -810,6 +856,12 @@ pub enum StaticStrings {
     Commonprefix,
     /// `field(compare=...)`.
     Compare,
+    /// `Decimal.compare_signal()` / `Context.compare_signal()`.
+    CompareSignal,
+    /// `Decimal.compare_total()` / `Context.compare_total()`.
+    CompareTotal,
+    /// `Decimal.compare_total_mag()` / `Context.compare_total_mag()`.
+    CompareTotalMag,
     /// `re.compile()` function
     Compile,
     /// `itertools.compress()` function.
@@ -826,10 +878,20 @@ pub enum StaticStrings {
     ConversionSyntax,
     /// `copy()` method, shared by `list`, `dict` and `set`; also the `copy` module and `copy.copy()`.
     Copy,
+    /// `Decimal.copy_abs()` / `Context.copy_abs()`.
+    CopyAbs,
+    /// `Context.copy_decimal()`.
+    CopyDecimal,
+    /// `Decimal.copy_negate()` / `Context.copy_negate()`.
+    CopyNegate,
+    /// `Decimal.copy_sign()` / `Context.copy_sign()`.
+    CopySign,
     /// `sys.copyright` attribute.
     Copyright,
     /// `math.copysign()` function.
     Copysign,
+    /// `coro` parameter of `asyncio.create_task()`.
+    Coro,
     /// `math.cos()` function.
     Cos,
     /// `math.cosh()` function.
@@ -850,6 +912,13 @@ pub enum StaticStrings {
     /// `binascii.crc_hqx()` function.
     #[strum(serialize = "crc_hqx")]
     CrcHqx,
+    /// `Context.create_decimal()`.
+    CreateDecimal,
+    /// `Context.create_decimal_from_float()`.
+    CreateDecimalFromFloat,
+    /// `asyncio.create_task()` function.
+    #[strum(serialize = "create_task")]
+    CreateTask,
     /// Module name for `import csv`.
     Csv,
     /// `time.ctime()` function.
@@ -915,6 +984,9 @@ pub enum StaticStrings {
     Deepcopy,
     /// Kwarg name `default` — `os.getenv(default=...)`.
     Default,
+    /// `io.DEFAULT_BUFFER_SIZE` constant.
+    #[strum(serialize = "DEFAULT_BUFFER_SIZE")]
+    DefaultBufferSize,
     /// `decimal.DefaultContext` template context.
     #[strum(serialize = "DefaultContext")]
     DefaultContext,
@@ -934,12 +1006,16 @@ pub enum StaticStrings {
     Degrees,
     /// `delay` parameter of `asyncio.sleep()`.
     Delay,
+    /// `delete` parameter of `bytes.translate()`.
+    Delete,
     /// `delimiter` dialect attribute and `csv` format parameter.
     Delimiter,
     /// `depth` parameter of `hashlib.blake2b()`.
     Depth,
     /// The `collections.deque` type.
     Deque,
+    /// `detach()` method of the io classes.
+    Detach,
     /// `sys.flags.dev_mode` field.
     DevMode,
     /// Value of `os.devnull`.
@@ -981,6 +1057,10 @@ pub enum StaticStrings {
     Discard,
     /// `math.dist()` function.
     Dist,
+    /// `Context.divide()`.
+    Divide,
+    /// `Context.divide_int()`.
+    DivideInt,
     /// `decimal.DivisionByZero` signal.
     #[strum(serialize = "DivisionByZero")]
     DivisionByZero,
@@ -990,10 +1070,14 @@ pub enum StaticStrings {
     /// `decimal.DivisionUndefined` condition.
     #[strum(serialize = "DivisionUndefined")]
     DivisionUndefined,
+    /// `Context.divmod()`.
+    Divmod,
     /// `dklen` parameter of `hashlib.pbkdf2_hmac()`.
     Dklen,
     /// `field(doc=...)`, CPython's per-field docstring.
     Doc,
+    /// `asyncio.Task.done()` method.
+    Done,
     /// `sys.dont_write_bytecode` attribute.
     DontWriteBytecode,
     /// `re.DOTALL` flag
@@ -1001,6 +1085,8 @@ pub enum StaticStrings {
     DotallFlag,
     /// `doublequote` dialect attribute and `csv` format parameter.
     Doublequote,
+    /// `Path.drive` property.
+    Drive,
     /// `itertools.dropwhile()` function.
     Dropwhile,
     /// Kwarg name `dst` — `os.rename(dst=...)`, `os.replace(dst=...)`.
@@ -1039,12 +1125,27 @@ pub enum StaticStrings {
     /// `__classcell__` — class-namespace entry carrying the implicit `__class__` cell to `type.__new__`.
     #[strum(serialize = "__classcell__")]
     DunderClasscell,
+    /// `Decimal.__ceil__()`.
+    #[strum(serialize = "__ceil__")]
+    DunderCeil,
+    /// `Decimal.__complex__()`.
+    #[strum(serialize = "__complex__")]
+    DunderComplex,
     /// `__context__` of an exception: the one being handled when it was raised.
     #[strum(serialize = "__context__")]
     DunderContext,
+    /// `Decimal.__copy__()` / `Context.__copy__()`.
+    #[strum(serialize = "__copy__")]
+    DunderCopy,
+    /// `Decimal.__deepcopy__()`.
+    #[strum(serialize = "__deepcopy__")]
+    DunderDeepcopy,
     /// `__delattr__` — the frozen-dataclass hook `@dataclass` generates.
     #[strum(serialize = "__delattr__")]
     DunderDelattr,
+    /// `Context.__delitem__()`.
+    #[strum(serialize = "__delitem__")]
+    DunderDelitem,
     /// `__doc__` — synthesized into the namespace of classes created by the
     /// 3-arg `type()` builtin when the caller's dict omits it.
     #[strum(serialize = "__doc__")]
@@ -1052,6 +1153,15 @@ pub enum StaticStrings {
     /// `__eq__` — written into a class namespace by `@dataclass`.
     #[strum(serialize = "__eq__")]
     DunderEq,
+    /// `Decimal.__float__()`.
+    #[strum(serialize = "__float__")]
+    DunderFloat,
+    /// `Decimal.__floor__()`.
+    #[strum(serialize = "__floor__")]
+    DunderFloor,
+    /// `Decimal.__format__()`.
+    #[strum(serialize = "__format__")]
+    DunderFormat,
     /// `__forward_arg__` — the source text of an `annotationlib.ForwardRef`.
     #[strum(serialize = "__forward_arg__")]
     DunderForwardArg,
@@ -1073,6 +1183,12 @@ pub enum StaticStrings {
     /// `__init__` — written into a class namespace by `@dataclass`.
     #[strum(serialize = "__init__")]
     DunderInit,
+    /// `object.__init_subclass__` class creation hook.
+    #[strum(serialize = "__init_subclass__")]
+    DunderInitSubclass,
+    /// `Decimal.__int__()`.
+    #[strum(serialize = "__int__")]
+    DunderInt,
     /// `decimal.__libmpdec_version__` attribute.
     #[strum(serialize = "__libmpdec_version__")]
     DunderLibmpdecVersion,
@@ -1091,6 +1207,12 @@ pub enum StaticStrings {
     /// `__name__` attribute of a type.
     #[strum(serialize = "__name__")]
     DunderName,
+    /// `object.__new__` instance construction hook.
+    #[strum(serialize = "__new__")]
+    DunderNew,
+    /// `generator.__next__`.
+    #[strum(serialize = "__next__")]
+    DunderNext,
     /// `__origin__` of a `types.GenericAlias`.
     #[strum(serialize = "__origin__")]
     DunderOrigin,
@@ -1103,37 +1225,178 @@ pub enum StaticStrings {
     /// `__qualname__` — the qualified class name, exposed on namedtuple classes.
     #[strum(serialize = "__qualname__")]
     DunderQualname,
+    /// `Decimal.__reduce__()`.
+    #[strum(serialize = "__reduce__")]
+    DunderReduce,
     /// `__repr__` — written into a class namespace by `@dataclass`.
     #[strum(serialize = "__repr__")]
     DunderRepr,
     /// `__resolved_str__` attribute of `annotationlib.ForwardRef`.
     #[strum(serialize = "__resolved_str__")]
     DunderResolvedStr,
+    /// `Decimal.__round__()`.
+    #[strum(serialize = "__round__")]
+    DunderRound,
     /// `__setattr__` — the frozen-dataclass hook `@dataclass` generates.
     #[strum(serialize = "__setattr__")]
     DunderSetattr,
     /// `__suppress_context__` of an exception, set by `raise ... from`.
     #[strum(serialize = "__suppress_context__")]
     DunderSuppressContext,
+    /// `Decimal.__trunc__()`.
+    #[strum(serialize = "__trunc__")]
+    DunderTrunc,
     /// `decimal.__version__` attribute.
     #[strum(serialize = "__version__")]
     DunderVersion,
     /// The uncached callable.
     #[strum(serialize = "__wrapped__")]
     DunderWrapped,
+    #[strum(serialize = "E2BIG")]
+    E2big,
+    #[strum(serialize = "EACCES")]
+    Eacces,
+    #[strum(serialize = "EADDRINUSE")]
+    Eaddrinuse,
+    #[strum(serialize = "EADDRNOTAVAIL")]
+    Eaddrnotavail,
+    #[strum(serialize = "EADV")]
+    Eadv,
+    #[strum(serialize = "EAFNOSUPPORT")]
+    Eafnosupport,
+    #[strum(serialize = "EAGAIN")]
+    Eagain,
+    #[strum(serialize = "EALREADY")]
+    Ealready,
+    #[strum(serialize = "EBADE")]
+    Ebade,
+    #[strum(serialize = "EBADF")]
+    Ebadf,
+    #[strum(serialize = "EBADFD")]
+    Ebadfd,
+    #[strum(serialize = "EBADMSG")]
+    Ebadmsg,
+    #[strum(serialize = "EBADR")]
+    Ebadr,
+    #[strum(serialize = "EBADRQC")]
+    Ebadrqc,
+    #[strum(serialize = "EBADSLT")]
+    Ebadslt,
+    #[strum(serialize = "EBFONT")]
+    Ebfont,
+    #[strum(serialize = "EBUSY")]
+    Ebusy,
+    #[strum(serialize = "ECANCELED")]
+    Ecanceled,
+    #[strum(serialize = "ECHILD")]
+    Echild,
+    #[strum(serialize = "ECHRNG")]
+    Echrng,
+    #[strum(serialize = "ECOMM")]
+    Ecomm,
+    #[strum(serialize = "ECONNABORTED")]
+    Econnaborted,
+    #[strum(serialize = "ECONNREFUSED")]
+    Econnrefused,
+    #[strum(serialize = "ECONNRESET")]
+    Econnreset,
+    #[strum(serialize = "EDEADLK")]
+    Edeadlk,
+    #[strum(serialize = "EDEADLOCK")]
+    Edeadlock,
+    #[strum(serialize = "EDESTADDRREQ")]
+    Edestaddrreq,
+    #[strum(serialize = "EDOM")]
+    Edom,
+    #[strum(serialize = "EDOTDOT")]
+    Edotdot,
+    #[strum(serialize = "EDQUOT")]
+    Edquot,
+    #[strum(serialize = "EEXIST")]
+    Eexist,
+    #[strum(serialize = "EFAULT")]
+    Efault,
+    #[strum(serialize = "EFBIG")]
+    Efbig,
+    #[strum(serialize = "EHOSTDOWN")]
+    Ehostdown,
+    #[strum(serialize = "EHOSTUNREACH")]
+    Ehostunreach,
+    #[strum(serialize = "EHWPOISON")]
+    Ehwpoison,
+    #[strum(serialize = "EIDRM")]
+    Eidrm,
+    #[strum(serialize = "EILSEQ")]
+    Eilseq,
+    #[strum(serialize = "EINPROGRESS")]
+    Einprogress,
+    #[strum(serialize = "EINTR")]
+    Eintr,
+    #[strum(serialize = "EINVAL")]
+    Einval,
+    #[strum(serialize = "EIO")]
+    Eio,
+    #[strum(serialize = "EISCONN")]
+    Eisconn,
+    #[strum(serialize = "EISDIR")]
+    Eisdir,
+    #[strum(serialize = "EISNAM")]
+    Eisnam,
+    #[strum(serialize = "EKEYEXPIRED")]
+    Ekeyexpired,
+    #[strum(serialize = "EKEYREJECTED")]
+    Ekeyrejected,
+    #[strum(serialize = "EKEYREVOKED")]
+    Ekeyrevoked,
+    #[strum(serialize = "EL2HLT")]
+    El2hlt,
+    #[strum(serialize = "EL2NSYNC")]
+    El2nsync,
+    #[strum(serialize = "EL3HLT")]
+    El3hlt,
+    #[strum(serialize = "EL3RST")]
+    El3rst,
     /// `Counter.elements()` method.
     Elements,
+    #[strum(serialize = "ELIBACC")]
+    Elibacc,
+    #[strum(serialize = "ELIBBAD")]
+    Elibbad,
+    #[strum(serialize = "ELIBEXEC")]
+    Elibexec,
+    #[strum(serialize = "ELIBMAX")]
+    Elibmax,
+    #[strum(serialize = "ELIBSCN")]
+    Elibscn,
     /// `repr()`/`str()` text of `Ellipsis`, interned so rendering allocates nothing.
     #[strum(serialize = "Ellipsis")]
     EllipsisRepr,
+    #[strum(serialize = "ELNRNG")]
+    Elnrng,
+    #[strum(serialize = "ELOOP")]
+    Eloop,
     /// Kwarg name `Emax` — `decimal.Context()`.
     #[strum(serialize = "Emax")]
     Emax,
+    #[strum(serialize = "EMEDIUMTYPE")]
+    Emediumtype,
+    #[strum(serialize = "EMFILE")]
+    Emfile,
     /// Kwarg name `Emin` — `decimal.Context()`.
     #[strum(serialize = "Emin")]
     Emin,
+    #[strum(serialize = "EMLINK")]
+    Emlink,
+    #[strum(serialize = "EMSGSIZE")]
+    Emsgsize,
+    #[strum(serialize = "EMULTIHOP")]
+    Emultihop,
     /// `gc.enable()` function.
     Enable,
+    #[strum(serialize = "ENAMETOOLONG")]
+    Enametoolong,
+    #[strum(serialize = "ENAVAIL")]
+    Enavail,
     /// `str.encode()` method.
     Encode,
     /// `base64.encodebytes()` function.
@@ -1145,6 +1408,74 @@ pub enum StaticStrings {
     End,
     /// `endswith()` method, shared by `str` and `bytes`.
     Endswith,
+    #[strum(serialize = "ENETDOWN")]
+    Enetdown,
+    #[strum(serialize = "ENETRESET")]
+    Enetreset,
+    #[strum(serialize = "ENETUNREACH")]
+    Enetunreach,
+    #[strum(serialize = "ENFILE")]
+    Enfile,
+    #[strum(serialize = "ENOANO")]
+    Enoano,
+    #[strum(serialize = "ENOBUFS")]
+    Enobufs,
+    #[strum(serialize = "ENOCSI")]
+    Enocsi,
+    #[strum(serialize = "ENODATA")]
+    Enodata,
+    #[strum(serialize = "ENODEV")]
+    Enodev,
+    #[strum(serialize = "ENOENT")]
+    Enoent,
+    #[strum(serialize = "ENOEXEC")]
+    Enoexec,
+    #[strum(serialize = "ENOKEY")]
+    Enokey,
+    #[strum(serialize = "ENOLCK")]
+    Enolck,
+    #[strum(serialize = "ENOLINK")]
+    Enolink,
+    #[strum(serialize = "ENOMEDIUM")]
+    Enomedium,
+    #[strum(serialize = "ENOMEM")]
+    Enomem,
+    #[strum(serialize = "ENOMSG")]
+    Enomsg,
+    #[strum(serialize = "ENONET")]
+    Enonet,
+    #[strum(serialize = "ENOPKG")]
+    Enopkg,
+    #[strum(serialize = "ENOPROTOOPT")]
+    Enoprotoopt,
+    #[strum(serialize = "ENOSPC")]
+    Enospc,
+    #[strum(serialize = "ENOSR")]
+    Enosr,
+    #[strum(serialize = "ENOSTR")]
+    Enostr,
+    #[strum(serialize = "ENOSYS")]
+    Enosys,
+    #[strum(serialize = "ENOTBLK")]
+    Enotblk,
+    #[strum(serialize = "ENOTCONN")]
+    Enotconn,
+    #[strum(serialize = "ENOTDIR")]
+    Enotdir,
+    #[strum(serialize = "ENOTEMPTY")]
+    Enotempty,
+    #[strum(serialize = "ENOTNAM")]
+    Enotnam,
+    #[strum(serialize = "ENOTRECOVERABLE")]
+    Enotrecoverable,
+    #[strum(serialize = "ENOTSOCK")]
+    Enotsock,
+    #[strum(serialize = "ENOTSUP")]
+    Enotsup,
+    #[strum(serialize = "ENOTTY")]
+    Enotty,
+    #[strum(serialize = "ENOTUNIQ")]
+    Enotuniq,
     /// `json.dumps(ensure_ascii=...)` keyword.
     #[strum(serialize = "ensure_ascii")]
     EnsureAscii,
@@ -1153,14 +1484,50 @@ pub enum StaticStrings {
     Enter,
     /// `os.environ` attribute.
     Environ,
+    #[strum(serialize = "ENXIO")]
+    Enxio,
+    #[strum(serialize = "EOPNOTSUPP")]
+    Eopnotsupp,
+    #[strum(serialize = "EOVERFLOW")]
+    Eoverflow,
+    #[strum(serialize = "EOWNERDEAD")]
+    Eownerdead,
+    #[strum(serialize = "EPERM")]
+    Eperm,
+    #[strum(serialize = "EPFNOSUPPORT")]
+    Epfnosupport,
+    #[strum(serialize = "EPIPE")]
+    Epipe,
+    #[strum(serialize = "EPROTO")]
+    Eproto,
+    #[strum(serialize = "EPROTONOSUPPORT")]
+    Eprotonosupport,
+    #[strum(serialize = "EPROTOTYPE")]
+    Eprototype,
     /// `sys.float_info.epsilon` field.
     Epsilon,
     /// `@dataclass(eq=...)`.
     Eq,
+    #[strum(serialize = "ERANGE")]
+    Erange,
+    #[strum(serialize = "EREMCHG")]
+    Eremchg,
+    #[strum(serialize = "EREMOTE")]
+    Eremote,
+    #[strum(serialize = "EREMOTEIO")]
+    Eremoteio,
+    #[strum(serialize = "ERESTART")]
+    Erestart,
     /// `math.erf()` function.
     Erf,
     /// `math.erfc()` function.
     Erfc,
+    #[strum(serialize = "ERFKILL")]
+    Erfkill,
+    #[strum(serialize = "EROFS")]
+    Erofs,
+    /// Module name for Linux error-number constants.
+    Errno,
     /// `re.error` exception alias (same as `re.PatternError`)
     #[strum(serialize = "error")]
     Error,
@@ -1168,12 +1535,50 @@ pub enum StaticStrings {
     /// is the lowercase `re.error` alias.
     #[strum(serialize = "Error")]
     ErrorClass,
+    /// Numeric errno values mapped to their symbolic names.
+    Errorcode,
     /// Kwarg name `errors` — `open(errors=...)`.
     Errors,
     /// `re.escape()` function
     Escape,
     /// `escapechar` dialect attribute and `csv` format parameter.
     Escapechar,
+    #[strum(serialize = "ESHUTDOWN")]
+    Eshutdown,
+    #[strum(serialize = "ESOCKTNOSUPPORT")]
+    Esocktnosupport,
+    #[strum(serialize = "ESPIPE")]
+    Espipe,
+    #[strum(serialize = "ESRCH")]
+    Esrch,
+    #[strum(serialize = "ESRMNT")]
+    Esrmnt,
+    #[strum(serialize = "ESTALE")]
+    Estale,
+    #[strum(serialize = "ESTRPIPE")]
+    Estrpipe,
+    #[strum(serialize = "ETIME")]
+    Etime,
+    #[strum(serialize = "ETIMEDOUT")]
+    Etimedout,
+    /// `Context.Etiny()`.
+    #[strum(serialize = "Etiny")]
+    Etiny,
+    #[strum(serialize = "ETOOMANYREFS")]
+    Etoomanyrefs,
+    /// `Context.Etop()`.
+    #[strum(serialize = "Etop")]
+    Etop,
+    #[strum(serialize = "ETXTBSY")]
+    Etxtbsy,
+    #[strum(serialize = "EUCLEAN")]
+    Euclean,
+    #[strum(serialize = "EUNATCH")]
+    Eunatch,
+    #[strum(serialize = "EUSERS")]
+    Eusers,
+    #[strum(serialize = "EWOULDBLOCK")]
+    Ewouldblock,
     /// `eval_str` parameter of `annotationlib.get_annotations()`.
     EvalStr,
     /// `ForwardRef.evaluate()` method.
@@ -1182,10 +1587,16 @@ pub enum StaticStrings {
     Excel,
     /// `csv.excel_tab` dialect.
     ExcelTab,
+    /// `asyncio.Task.exception()` method.
+    Exception,
+    #[strum(serialize = "EXDEV")]
+    Exdev,
     /// `sys.exec_prefix` attribute.
     ExecPrefix,
     /// `sys.executable` attribute.
     Executable,
+    #[strum(serialize = "EXFULL")]
+    Exfull,
     /// Kwarg name `exist_ok` — `Path.mkdir(exist_ok=...)`.
     ExistOk,
     /// `Path.exists()` method — yields a host call.
@@ -1233,6 +1644,8 @@ pub enum StaticStrings {
     FalseRepr,
     /// `fanout` parameter of `hashlib.blake2b()`.
     Fanout,
+    Fdel,
+    Fget,
     /// `dataclasses.field()` function, and the `Field` type name.
     Field,
     /// `namedtuple(field_names=...)` keyword argument.
@@ -1246,6 +1659,8 @@ pub enum StaticStrings {
     File,
     /// Kwarg name `filename` — `os.path.getsize(filename=...)`, `os.path.realpath(filename=...)`.
     Filename,
+    /// `fileno()` method of the io classes.
+    Fileno,
     /// `zip_longest(fillvalue=...)` keyword.
     Fillvalue,
     /// `fnmatch.filter()` function.
@@ -1263,6 +1678,12 @@ pub enum StaticStrings {
     Findall,
     /// `re.finditer()` / `pattern.finditer()` method
     Finditer,
+    /// `asyncio.FIRST_COMPLETED`.
+    #[strum(serialize = "FIRST_COMPLETED")]
+    FirstCompleted,
+    /// `asyncio.FIRST_EXCEPTION`.
+    #[strum(serialize = "FIRST_EXCEPTION")]
+    FirstException,
     /// `pattern.flags`
     Flags,
     /// `sys.float_info` attribute.
@@ -1310,17 +1731,21 @@ pub enum StaticStrings {
     Fp,
     /// `math.frexp()` function.
     Frexp,
+    /// `Decimal.from_float()`.
+    FromFloat,
     /// `chain.from_iterable` — the one attribute an `itertools` type carries.
     #[strum(serialize = "from_iterable")]
     FromIterable,
     /// `complex.from_number()` classmethod.
     FromNumber,
-    /// `bytes.fromhex()` classmethod.
+    /// `bytes.fromhex()` and `float.fromhex()` classmethods.
     Fromhex,
     /// `date.fromisoformat()` / `datetime.fromisoformat()` classmethod.
     Fromisoformat,
     /// `dict.fromkeys()` classmethod.
     Fromkeys,
+    /// `date.fromordinal()` / `datetime.fromordinal()` classmethod.
+    Fromordinal,
     /// `date.fromtimestamp()` / `datetime.fromtimestamp()` classmethod.
     Fromtimestamp,
     /// `@dataclass(frozen=...)`.
@@ -1331,6 +1756,9 @@ pub enum StaticStrings {
     /// `typing.FrozenSet` marker.
     #[strum(serialize = "FrozenSet")]
     FrozenSet,
+    /// `fs` parameter of `asyncio.wait()`.
+    Fs,
+    Fset,
     /// `Path.__fspath__()` method, answered without host I/O.
     #[strum(serialize = "__fspath__")]
     Fspath,
@@ -1364,8 +1792,12 @@ pub enum StaticStrings {
     Get,
     /// `annotationlib.get_annotations()` function.
     GetAnnotations,
+    /// `asyncio.Task.get_coro()` method.
+    GetCoro,
     /// `csv.get_dialect()` function.
     GetDialect,
+    /// `asyncio.Task.get_name()` method.
+    GetName,
     /// `typing.get_type_hints()` function.
     GetTypeHints,
     /// `os.path.getatime()` function.
@@ -1388,6 +1820,8 @@ pub enum StaticStrings {
     Getsize,
     /// `random.getstate()` function.
     Getstate,
+    /// `StringIO.getvalue()` / `BytesIO.getvalue()` method.
+    Getvalue,
     /// `Path.glob()` method — yields a host scan.
     Glob,
     /// `globalns` parameter of `typing.get_type_hints()`.
@@ -1424,7 +1858,7 @@ pub enum StaticStrings {
     /// `header` parameter of the `binascii` quoted-printable pair.
     #[strum(serialize = "header")]
     Header,
-    /// `bytes.hex()` method.
+    /// `bytes.hex()` and `float.hex()` methods.
     Hex,
     /// `hexdigest()` method of a hash object.
     Hexdigest,
@@ -1483,6 +1917,10 @@ pub enum StaticStrings {
     /// `initial` keyword argument of `functools.reduce()` and
     /// `itertools.accumulate()`.
     Initial,
+    /// Kwarg name `initial_bytes` — `io.BytesIO(initial_bytes=...)`.
+    InitialBytes,
+    /// Kwarg name `initial_value` — `io.StringIO(initial_value=...)`.
+    InitialValue,
     /// `inner_size` parameter of `hashlib.blake2b()`.
     InnerSize,
     /// `list.insert()` method.
@@ -1507,10 +1945,15 @@ pub enum StaticStrings {
     /// `decimal.InvalidOperation` signal.
     #[strum(serialize = "InvalidOperation")]
     InvalidOperation,
+    /// `asyncio.InvalidStateError` class.
+    #[strum(serialize = "InvalidStateError")]
+    InvalidStateError,
     /// `Path.is_absolute()` method, answered without host I/O.
     IsAbsolute,
     /// `is_argument` parameter of `annotationlib.ForwardRef()`.
     IsArgument,
+    /// `Decimal.is_canonical()` / `Context.is_canonical()`.
+    IsCanonical,
     /// `is_class` parameter of `annotationlib.ForwardRef()`.
     IsClass,
     /// `dataclasses.is_dataclass()` function.
@@ -1519,13 +1962,33 @@ pub enum StaticStrings {
     IsDir,
     /// `Path.is_file()` method — yields a host call.
     IsFile,
+    /// `Decimal.is_finite()` / `Context.is_finite()`.
+    IsFinite,
+    /// `Decimal.is_infinite()` / `Context.is_infinite()`.
+    IsInfinite,
     /// `DirEntry.is_junction()` method.
     IsJunction,
+    /// `Decimal.is_nan()` / `Context.is_nan()`.
+    IsNan,
+    /// `Decimal.is_normal()` / `Context.is_normal()`.
+    IsNormal,
     /// `unicodedata.is_normalized()` function.
     #[strum(serialize = "is_normalized")]
     IsNormalized,
+    /// `Decimal.is_qnan()` / `Context.is_qnan()`.
+    IsQnan,
+    /// `Path.is_reserved()` method.
+    IsReserved,
+    /// `Decimal.is_signed()` / `Context.is_signed()`.
+    IsSigned,
+    /// `Decimal.is_snan()` / `Context.is_snan()`.
+    IsSnan,
+    /// `Decimal.is_subnormal()` / `Context.is_subnormal()`.
+    IsSubnormal,
     /// `Path.is_symlink()` method — yields a host call.
     IsSymlink,
+    /// `Decimal.is_zero()` / `Context.is_zero()`.
+    IsZero,
     /// `os.path.isabs()` function.
     Isabs,
     /// `isalnum()` method, shared by `str` and `bytes`.
@@ -1534,6 +1997,8 @@ pub enum StaticStrings {
     Isalpha,
     /// `isascii()` method, shared by `str` and `bytes`.
     Isascii,
+    /// `isatty()` method of the io classes.
+    Isatty,
     /// `math.isclose()` function.
     Isclose,
     /// `str.isdecimal()` method.
@@ -1554,6 +2019,8 @@ pub enum StaticStrings {
     Isidentifier,
     /// `math.isinf()` function.
     Isinf,
+    /// `is_integer()` method on `int` and `float`.
+    IsInteger,
     /// `os.path.isjunction()` function.
     Isjunction,
     /// `itertools.islice()` function.
@@ -1649,6 +2116,8 @@ pub enum StaticStrings {
     Lgamma,
     /// The value of `sys.platlibdir`.
     Lib,
+    /// `StringIO.line_buffering` attribute.
+    LineBuffering,
     /// `line_num` attribute of the `csv` readers.
     LineNum,
     /// `os.linesep` constant name.
@@ -1669,6 +2138,8 @@ pub enum StaticStrings {
     Little,
     /// `ljust()` method, shared by `str` and `bytes`.
     Ljust,
+    /// `Decimal.ln()` / `Context.ln()`.
+    Ln,
     /// `lo` in the bisect module.
     Lo,
     /// `json.load()` and `tomllib.load()` functions.
@@ -1691,6 +2162,16 @@ pub enum StaticStrings {
     Log1p,
     /// `math.log2()` function.
     Log2,
+    /// `Decimal.logb()` / `Context.logb()`.
+    Logb,
+    /// `Decimal.logical_and()` / `Context.logical_and()`.
+    LogicalAnd,
+    /// `Decimal.logical_invert()` / `Context.logical_invert()`.
+    LogicalInvert,
+    /// `Decimal.logical_or()` / `Context.logical_or()`.
+    LogicalOr,
+    /// `Decimal.logical_xor()` / `Context.logical_xor()`.
+    LogicalXor,
     /// `random.lognormvariate()` function.
     Lognormvariate,
     /// `unicodedata.lookup()` function.
@@ -1707,6 +2188,8 @@ pub enum StaticStrings {
     Major,
     /// `os.makedirs()` function.
     Makedirs,
+    /// `bytes.maketrans()` and `str.maketrans()` static methods.
+    Maketrans,
     /// `sys.float_info.mant_dig` field.
     MantDig,
     /// `map01` parameter of `base64.b32decode()`.
@@ -1755,6 +2238,8 @@ pub enum StaticStrings {
     /// `base64.MAXLINESIZE` module constant.
     #[strum(serialize = "MAXLINESIZE")]
     MaxLineSize,
+    /// `Decimal.max_mag()` / `Context.max_mag()`.
+    MaxMag,
     /// `decimal.MAX_PREC` constant.
     #[strum(serialize = "MAX_PREC")]
     MaxPrec,
@@ -1803,8 +2288,12 @@ pub enum StaticStrings {
     MinEtiny,
     /// `sys.float_info.min_exp` field.
     MinExp,
+    /// `Decimal.min_mag()` / `Context.min_mag()`.
+    MinMag,
     /// `sys.version_info.minor` field.
     Minor,
+    /// `Context.minus()`.
+    Minus,
     /// `datetime` / `time` `minute` attribute and constructor kwarg.
     Minute,
     /// `timedelta(minutes=...)` constructor kwarg.
@@ -1857,6 +2346,8 @@ pub enum StaticStrings {
     MultilineFlag,
     /// `statistics.multimode()` function.
     Multimode,
+    /// `Context.multiply()`.
+    Multiply,
     /// `Path.name` property; also `file.name`, `os.name` and `unicodedata.name()`.
     Name,
     /// The `collections.namedtuple` factory function.
@@ -1874,6 +2365,14 @@ pub enum StaticStrings {
     NewLimit,
     /// Kwarg name `newline` — `open(newline=...)`.
     Newline,
+    /// `StringIO.newlines` attribute.
+    Newlines,
+    /// `Decimal.next_minus()` / `Context.next_minus()`.
+    NextMinus,
+    /// `Decimal.next_plus()` / `Context.next_plus()`.
+    NextPlus,
+    /// `Decimal.next_toward()` / `Context.next_toward()`.
+    NextToward,
     /// `math.nextafter()` function.
     Nextafter,
     /// `_nil` parameter of `copy.deepcopy()`, CPython's private sentinel.
@@ -1913,6 +2412,8 @@ pub enum StaticStrings {
     Num,
     /// Kwarg name `number` — `round(number=...)`.
     Number,
+    /// `Decimal.number_class()` / `Context.number_class()`.
+    NumberClass,
     /// Kwarg name `obj` — `json.dumps(obj=...)`.
     Obj,
     /// Kwarg name `object` — `str(object=...)`, `itertools.repeat(object=...)`.
@@ -1926,9 +2427,11 @@ pub enum StaticStrings {
     /// Kwarg name `onerror` — `os.walk(onerror=...)`.
     Onerror,
     /// `Path.open()` and the `open()` builtin, which share the `OsFunctionCall::Open`
-    /// round-trip. `Path::py_call_attr` delegates to `builtin_open` for mode/kwarg
-    /// validation rather than taking the generic `is_path_os_method` pre-flight.
+    /// round-trip. `PyPathImpl::open` delegates to `builtin_open` for mode/kwarg
+    /// validation rather than building a generic path OS call.
     Open,
+    /// `io.open_code()` function.
+    OpenCode,
     /// Kwarg name `opener` — `open(opener=...)`.
     Opener,
     /// `sys.flags.optimize` field.
@@ -1995,6 +2498,8 @@ pub enum StaticStrings {
     PathClass,
     /// Module name for `import pathlib`.
     Pathlib,
+    /// Parameter name `path_pattern` — `Path.match(path_pattern=...)`.
+    PathPattern,
     /// Kwarg name `paths` — `os.path.commonpath(paths=...)`.
     Paths,
     /// `os.pathsep` / `os.path.pathsep` constant name.
@@ -2029,6 +2534,8 @@ pub enum StaticStrings {
     Platform,
     /// `sys.platlibdir` attribute.
     Platlibdir,
+    /// `Context.plus()`.
+    Plus,
     /// `pop()` method, shared by `list`, `dict`, `set` and `deque`.
     Pop,
     /// `dict.popitem()` method.
@@ -2046,6 +2553,8 @@ pub enum StaticStrings {
     PostInit,
     /// `math.pow()` function.
     Pow,
+    /// `Context.power()`.
+    Power,
     /// Kwarg name `prec` — `decimal.Context()`.
     Prec,
     /// `sys.prefix` attribute.
@@ -2069,6 +2578,8 @@ pub enum StaticStrings {
     PycachePrefix,
     /// `statistics.quantiles()` function.
     Quantiles,
+    /// `Decimal.quantize()` / `Context.quantize()`.
+    Quantize,
     /// `sys.flags.quiet` field.
     Quiet,
     /// `csv.QUOTE_ALL` constant.
@@ -2120,6 +2631,9 @@ pub enum StaticStrings {
     Re,
     /// `file.read()` method.
     Read,
+    /// `BytesIO.read1()` method.
+    #[strum(serialize = "read1")]
+    Read1,
     /// `Path.read_bytes()` method — yields a host call.
     ReadBytes,
     /// `Path.read_text()` method — yields a host call.
@@ -2148,6 +2662,8 @@ pub enum StaticStrings {
     Relpath,
     /// `math.remainder()` function.
     Remainder,
+    /// `Decimal.remainder_near()` / `Context.remainder_near()`.
+    RemainderNear,
     /// `remove()` method, shared by `set`, `list` and `deque`.
     Remove,
     /// `removeprefix()` method, shared by `str` and `bytes`.
@@ -2172,11 +2688,13 @@ pub enum StaticStrings {
     Restkey,
     /// `restval` parameter and attribute of `csv.DictReader` / `csv.DictWriter`.
     Restval,
-    /// `result` parameter of `asyncio.sleep()`.
+    /// `result` parameter of `asyncio.sleep()` and `Task.result()` method.
     #[strum(serialize = "result")]
-    ResultArg,
+    Result,
     /// Kwarg name `return_exceptions` — `asyncio.gather(return_exceptions=...)`.
     ReturnExceptions,
+    /// `return_when` parameter of `asyncio.wait()`.
+    ReturnWhen,
     /// `list.reverse()` method.
     Reverse,
     /// `rfind()` method, shared by `str` and `bytes`.
@@ -2189,6 +2707,8 @@ pub enum StaticStrings {
     Rjust,
     /// `Path.rmdir()` and `os.rmdir()` — yields a host call.
     Rmdir,
+    /// `Path.root` property.
+    Root,
     /// `deque.rotate()` method.
     Rotate,
     /// `decimal.ROUND_05UP` rounding mode.
@@ -2241,12 +2761,16 @@ pub enum StaticStrings {
     /// `blake2b.SALT_SIZE` class constant.
     #[strum(serialize = "SALT_SIZE")]
     SaltSize,
+    /// `Decimal.same_quantum()` / `Context.same_quantum()`.
+    SameQuantum,
     /// `os.path.samefile()` function.
     Samefile,
     /// `os.path.samestat()` function.
     Samestat,
     /// `random.sample()` function.
     Sample,
+    /// `Decimal.scaleb()` / `Context.scaleb()`.
+    Scaleb,
     /// `os.scandir()` function — yields a host scan.
     Scandir,
     /// `re.search()` / `pattern.search()` method
@@ -2259,6 +2783,15 @@ pub enum StaticStrings {
     Seed,
     /// `file.seek()` method.
     Seek,
+    /// `io.SEEK_CUR` constant.
+    #[strum(serialize = "SEEK_CUR")]
+    SeekCur,
+    /// `io.SEEK_END` constant.
+    #[strum(serialize = "SEEK_END")]
+    SeekEnd,
+    /// `io.SEEK_SET` constant.
+    #[strum(serialize = "SEEK_SET")]
+    SeekSet,
     /// `file.seekable()` method.
     Seekable,
     /// `selectors` keyword argument of `itertools.compress()`.
@@ -2266,6 +2799,8 @@ pub enum StaticStrings {
     /// `typing.Self` marker.
     #[strum(serialize = "Self")]
     SelfType,
+    /// `generator.send`.
+    Send,
     /// Kwarg name `sep` — `str.split(sep=...)`, `print(sep=...)`, etc.
     Sep,
     /// `json.dumps(separators=...)` keyword.
@@ -2277,6 +2812,8 @@ pub enum StaticStrings {
     Sequence,
     /// `sys.version_info.serial` field.
     Serial,
+    /// `asyncio.Task.set_name()` method.
+    SetName,
     /// `typing.Set` marker.
     #[strum(serialize = "Set")]
     SetType,
@@ -2316,6 +2853,8 @@ pub enum StaticStrings {
     /// `hashlib.shake_256()` function and hash name.
     #[strum(serialize = "shake_256")]
     Shake256,
+    /// `Decimal.shift()` / `Context.shift()`.
+    Shift,
     /// The value of `sys.float_repr_style`.
     Short,
     /// `random.shuffle()` function.
@@ -2432,6 +2971,9 @@ pub enum StaticStrings {
     /// `annotationlib.Format.STRING` member.
     #[strum(serialize = "STRING")]
     StringFormat,
+    /// `io.StringIO` in-memory text stream.
+    #[strum(serialize = "StringIO")]
+    StringIo,
     /// `strip()` method, shared by `str` and `bytes`.
     Strip,
     /// `datetime.strptime()` classmethod.
@@ -2479,6 +3021,9 @@ pub enum StaticStrings {
     Tanh,
     /// Destination keyword for Path.rename and Path.replace.
     Target,
+    /// `asyncio.Task` class.
+    #[strum(serialize = "Task")]
+    Task,
     /// `math.tau` constant
     Tau,
     /// `itertools.tee()` function.
@@ -2491,6 +3036,11 @@ pub enum StaticStrings {
     TeeType,
     /// `file.tell()` method.
     Tell,
+    /// `io.text_encoding()` function.
+    TextEncoding,
+    /// `io.TextIOWrapper` file class.
+    #[strum(serialize = "TextIOWrapper")]
+    TextIoWrapper,
     /// Kwarg name `third` — `Decimal.fma()`.
     Third,
     /// `time.thread_time()` function.
@@ -2503,12 +3053,16 @@ pub enum StaticStrings {
     TimeNs,
     /// The `datetime.timedelta` type.
     Timedelta,
+    /// `timeout` parameter of `asyncio.wait()`.
+    Timeout,
     /// `times` keyword argument of `itertools.repeat()`.
     Times,
     /// `timespec` keyword of `time.isoformat()` and `datetime.isoformat()`.
     Timespec,
     /// `datetime.timestamp()` method.
     Timestamp,
+    /// `date.timetuple()` method.
+    Timetuple,
     /// `datetime.timetz` method name.
     Timetz,
     /// The `datetime.timezone` type.
@@ -2537,6 +3091,16 @@ pub enum StaticStrings {
     TmYear,
     /// `struct_time.tm_zone` field.
     TmZone,
+    /// `Decimal.to_eng_string()` / `Context.to_eng_string()`.
+    ToEngString,
+    /// `Decimal.to_integral()` / `Context.to_integral()`.
+    ToIntegral,
+    /// `Decimal.to_integral_exact()` / `Context.to_integral_exact()`.
+    ToIntegralExact,
+    /// `Decimal.to_integral_value()` / `Context.to_integral_value()`.
+    ToIntegralValue,
+    /// `Context.to_sci_string()`.
+    ToSciString,
     /// `date.today()` / `datetime.today()` classmethod.
     Today,
     /// `tomllib.TOMLDecodeError` exception.
@@ -2544,6 +3108,8 @@ pub enum StaticStrings {
     TomlDecodeError,
     /// Module name for `import tomllib`.
     Tomllib,
+    /// `date.toordinal()` / `datetime.toordinal()` method.
+    Toordinal,
     /// Kwarg name `top` — `os.walk(top=...)`.
     Top,
     /// Kwarg name `top_down` — `Path.walk(top_down=...)`.
@@ -2554,7 +3120,7 @@ pub enum StaticStrings {
     Total,
     /// `timedelta.total_seconds()` method.
     TotalSeconds,
-    /// `fnmatch.translate()` function.
+    /// `fnmatch.translate()` function and `str.translate()` method.
     Translate,
     /// Kwarg name `traps` — `decimal.Context()`.
     Traps,
@@ -2565,9 +3131,13 @@ pub enum StaticStrings {
     TrueRepr,
     /// `math.trunc()` function.
     Trunc,
+    /// `truncate()` method of the io classes.
+    Truncate,
     /// `typing.Tuple` marker.
     #[strum(serialize = "Tuple")]
     TupleType,
+    /// `typ` parameter of `typing.cast()`.
+    Typ,
     /// `typing.Type` marker.
     #[strum(serialize = "Type")]
     Type,
@@ -2594,6 +3164,9 @@ pub enum StaticStrings {
     Tzname,
     /// `math.ulp()` function.
     Ulp,
+    /// `Context.under_apply()`.
+    #[strum(serialize = "_apply")]
+    UnderApply,
     /// `NamedTuple._asdict()` method.
     #[strum(serialize = "_asdict")]
     UnderAsdict,
@@ -2603,6 +3176,9 @@ pub enum StaticStrings {
     /// `NamedTuple._fields` — tuple of field names.
     #[strum(serialize = "_fields")]
     UnderFields,
+    /// Module name for `import _io`, the native half of `io`.
+    #[strum(serialize = "_io")]
+    UnderIo,
     /// `NamedTuple._make(iterable)` classmethod.
     #[strum(serialize = "_make")]
     UnderMake,
@@ -2633,6 +3209,9 @@ pub enum StaticStrings {
     Unlink,
     /// `@dataclass(unsafe_hash=...)`.
     UnsafeHash,
+    /// `io.UnsupportedOperation` exception class.
+    #[strum(serialize = "UnsupportedOperation")]
+    UnsupportedOperation,
     /// `update()` method, shared by `set` and `dict`.
     Update,
     /// `upper()` method, shared by `str` and `bytes`.
@@ -2656,10 +3235,12 @@ pub enum StaticStrings {
     /// `sys.flags.utf8_mode` field.
     #[strum(serialize = "utf8_mode")]
     Utf8Mode,
+    /// `val` parameter of `typing.cast()` and `typing.assert_type()`.
+    Val,
     /// `validate` parameter of `base64.b64decode()`.
     #[strum(serialize = "validate")]
     Validate,
-    /// Kwarg name `value` — `decimal.Decimal()`.
+    /// Kwarg name `value` — `decimal.Decimal()`; also `StopIteration.value`.
     Value,
     /// `annotationlib.Format.VALUE` member.
     #[strum(serialize = "VALUE")]
@@ -2673,12 +3254,17 @@ pub enum StaticStrings {
     Variance,
     /// `sys.flags.verbose` field.
     Verbose,
+    /// `re.VERBOSE` flag constant.
+    #[strum(serialize = "VERBOSE")]
+    VerboseFlag,
     /// `sys.version` attribute.
     Version,
     /// `sys.version_info` attribute.
     VersionInfo,
     /// `random.vonmisesvariate()` function.
     Vonmisesvariate,
+    /// `asyncio.wait()` function.
+    Wait,
     /// `os.walk()` / `Path.walk()` — yields a host scan.
     Walk,
     /// `sys.flags.warn_default_encoding` field.
@@ -2712,6 +3298,8 @@ pub enum StaticStrings {
     WriteText,
     /// `csv.DictWriter.writeheader()` method.
     Writeheader,
+    /// `writelines()` method of the io classes.
+    Writelines,
     /// `csv.writer()` function and `csv.DictWriter.writer` attribute.
     Writer,
     /// `writerow()` method of the `csv` writers.
@@ -2735,13 +3323,13 @@ pub enum StaticStrings {
 }
 
 /// One immutable interned string with directly accessible dispatch metadata.
-/// Snapshots store only text; loading reconstructs the tag and cached hash.
+/// Snapshots store only text; loading reconstructs the tag, character length and cached hash.
 #[derive(Debug, Clone)]
 struct InternedString {
     /// Runtime classification, independent of the string's executor-local ID.
     static_tag: Option<StaticStrings>,
-    // Immutable text needs only one ASCII scan, including after snapshot loading.
-    ascii: bool,
+    /// Cached code-point count; empty strings and counts above `u32::MAX` are recounted.
+    char_len: Option<NonZeroU32>,
     /// Text and its eagerly computed Python hash.
     text: WithHash<InternedText>,
 }
@@ -2751,8 +3339,8 @@ struct InternedString {
 enum InternedText {
     /// Text recognized by this build, requiring no owned allocation.
     Static(&'static str),
-    /// Source or snapshot text unknown to the static registry.
-    Owned(Box<str>),
+    /// Source or snapshot text shared with its reverse lookup key.
+    Owned(Arc<str>),
 }
 
 impl AsRef<str> for InternedText {
@@ -2765,27 +3353,54 @@ impl AsRef<str> for InternedText {
 }
 
 impl InternedString {
+    /// Fits the count beside the static tag without enlarging each storage slot.
+    fn count_chars(text: &str) -> Option<NonZeroU32> {
+        let char_len = if text.is_ascii() {
+            text.len()
+        } else {
+            bytecount::num_chars(text.as_bytes())
+        };
+        u32::try_from(char_len).ok().and_then(NonZeroU32::new)
+    }
+
     /// Creates an entry for compile-time-known text.
     fn static_string(value: StaticStrings) -> Self {
         Self {
             static_tag: Some(value),
-            ascii: <&str>::from(value).is_ascii(),
+            char_len: Self::count_chars(value.into()),
             text: WithHash::for_str(InternedText::Static(value.into())),
         }
     }
 
     /// Creates an entry owning text not present in the static registry.
-    fn owned(value: String) -> Self {
+    fn owned(value: Arc<str>) -> Self {
         Self {
             static_tag: None,
-            ascii: value.is_ascii(),
-            text: WithHash::for_str(InternedText::Owned(value.into_boxed_str())),
+            char_len: Self::count_chars(&value),
+            text: WithHash::for_str(InternedText::Owned(value)),
         }
+    }
+
+    /// Returns the shared lookup key for a non-static entry.
+    fn owned_text(&self) -> &Arc<str> {
+        let InternedText::Owned(text) = self.text.value() else {
+            unreachable!("static entries are indexed by tag");
+        };
+        text
     }
 
     /// Returns the interned text.
     fn as_str(&self) -> &str {
         self.text.value().as_ref()
+    }
+
+    /// Recounts when the code-point count does not fit the cache.
+    #[inline]
+    fn char_len(&self) -> usize {
+        self.char_len.map_or_else(
+            || bytecount::num_chars(self.as_str().as_bytes()),
+            |len| len.get() as usize,
+        )
     }
 
     /// Returns the cached Python hash.
@@ -2807,10 +3422,15 @@ impl serde::Serialize for InternedString {
 
 impl<'de> serde::Deserialize<'de> for InternedString {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        // Borrow the CBOR text until it resolves to a static tag or its final allocation.
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+
+        let Text(value) = Text::deserialize(deserializer)?;
         Ok(match StaticStrings::from_str(&value) {
             Ok(static_string) => Self::static_string(static_string),
-            Err(_) => Self::owned(value),
+            Err(_) => Self::owned(Arc::from(value.as_ref())),
         })
     }
 }
@@ -2907,7 +3527,7 @@ fn next_string_id(strings_len: usize) -> StringId {
 
 /// Reverse of [`get_str`]: the `StringId` for `s`, or `None` if never interned.
 fn get_string_id_by_name(
-    string_map: &AHashMap<String, StringId>,
+    string_map: &AHashMap<Arc<str>, StringId>,
     static_string_ids: &RefCell<AHashMap<StaticStrings, StringId>>,
     s: &str,
 ) -> Option<StringId> {
@@ -2964,7 +3584,7 @@ pub(crate) struct Interns {
     #[serde(default)]
     file_sources: Entries<FileSource>,
     #[serde(skip)]
-    string_id_by_name: RefCell<AHashMap<String, StringId>>,
+    string_id_by_name: RefCell<AHashMap<Arc<str>, StringId>>,
     #[serde(skip)]
     static_string_ids: RefCell<AHashMap<StaticStrings, StringId>>,
     /// Prevents runtime insertion or a second compiler from consuming provisional IDs.
@@ -2999,21 +3619,29 @@ impl TryFrom<InternsWire> for Interns {
     type Error = String;
 
     fn try_from(wire: InternsWire) -> Result<Self, Self::Error> {
-        let mut string_id_by_name = AHashMap::new();
-        let mut static_string_ids = AHashMap::new();
-        let mut seen = AHashSet::new();
-        for (index, entry) in wire.strings.iter().enumerate() {
+        let strings = &wire.strings;
+        let static_count = strings.iter().filter(|entry| entry.static_value().is_some()).count();
+        let mut string_id_by_name = AHashMap::with_capacity(strings.len() - static_count);
+        let mut static_string_ids = AHashMap::with_capacity(static_count);
+
+        for (index, entry) in strings.iter().enumerate() {
             let text = entry.as_str();
-            if text.is_empty() || text.len() == 1 || !seen.insert(text) {
-                return Err(format!("duplicate or reserved interned string {text:?}"));
+            let invalid_entry = || format!("duplicate or reserved interned string {text:?}");
+            if text.len() <= 1 {
+                return Err(invalid_entry());
             }
+
             let id = next_string_id(index);
-            if let Some(value) = entry.static_value() {
-                static_string_ids.insert(value, id);
-            } else {
-                string_id_by_name.insert(text.to_owned(), id);
+            // The decoded tag partitions the text, so duplicates hit the same map.
+            let previous = match entry.static_value() {
+                Some(value) => static_string_ids.insert(value, id),
+                None => string_id_by_name.insert(Arc::clone(entry.owned_text()), id),
+            };
+            if previous.is_some() {
+                return Err(invalid_entry());
             }
         }
+
         Ok(Self {
             strings: wire.strings,
             bytes: wire.bytes,
@@ -3110,8 +3738,9 @@ impl Interns {
             intern_static(&self.static_string_ids, &self.strings, value)
         } else {
             let id = next_string_id(self.strings.len());
-            self.strings.push(InternedString::owned(text.to_owned()));
-            self.string_id_by_name.borrow_mut().insert(text.to_owned(), id);
+            let text: Arc<str> = Arc::from(text);
+            self.strings.push(InternedString::owned(Arc::clone(&text)));
+            self.string_id_by_name.borrow_mut().insert(text, id);
             id
         }
     }
@@ -3193,10 +3822,20 @@ impl Interns {
             .map(|file| &*file.source)
     }
 
-    /// Returns ASCII status without rescanning immutable literal text.
+    /// Compares character and byte lengths, using the cached count when available.
     #[inline]
     pub fn str_is_ascii(&self, id: StringId) -> bool {
-        id.index() < RESERVED_STRS.len() || self.strings[id.index() - INTERN_STRING_ID_OFFSET].ascii
+        self.str_char_len(id) == self.get_str(id).len()
+    }
+
+    /// Returns the Unicode code-point count, recounting when it does not fit the cache.
+    #[inline]
+    pub fn str_char_len(&self, id: StringId) -> usize {
+        if id.index() < RESERVED_STRS.len() {
+            RESERVED_STRS[id.index()].len()
+        } else {
+            self.strings[id.index() - INTERN_STRING_ID_OFFSET].char_len()
+        }
     }
 
     /// Returns the same hash as an equal heap string.
@@ -3251,3 +3890,7 @@ impl Interns {
         get_string_id_by_name(&self.string_id_by_name.borrow(), &self.static_string_ids, s)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/string_metadata.rs"]
+mod string_metadata_tests;

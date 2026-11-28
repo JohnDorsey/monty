@@ -14,17 +14,10 @@ any code runs.
     `name [: T] = <expr>` assignment, `pass`, or a docstring. Classes can inherit
     from other classes and `object` but not from native types, and there is no
     general dunder protocol. See [classes.md](classes.md).
-- **Decorators** (`@deco`) — supported on classes and on top-level or nested
-    `def`/`async def`, taking any callable in scope, evaluated in the enclosing
-    scope and applied bottom-up. Rejected at parse time on **methods**, so
-    `@classmethod`, `@staticmethod`, `@property` and any decorator on a `def`
-    inside a class body are unavailable. See [classes.md](classes.md).
 - **`async with` statements** — not yet supported.
-- **`yield` / `yield from` expressions** — no generator functions. Generator
-    *expressions* (`(x for x in ...)`) parse but currently materialize to a
-    `list` rather than a lazy iterator, a known temporary divergence; see
-    `iter__generator_expr_type.py`.
-- **`del` statements** — neither `del x` nor `del d[k]` parse.
+- **Async generator functions and expressions** — rejected with `NotImplementedError`.
+    See [generators.md](generators.md).
+- **Unsupported `del` forms** — `del x`, `del d[k]`, and multiple targets.
 - **`try*` / `except*` exception groups** — PEP 654 syntax rejected.
 - **`type` aliases** (PEP 695 `type Foo = int`).
 - **`async for` loops** and **async comprehensions**.
@@ -33,22 +26,25 @@ any code runs.
 
 - **Template strings (t-strings)** — PEP 750.
 
-## Starred unpacking
+## Unpacking
 
 Anything Monty can iterate may follow a `*`, matching CPython: `[*xs]`,
 `(*xs,)`, `{*xs}`, `f(*xs)`, `a, b = xs` and `a, *b = xs` all accept whatever
 `list(xs)` accepts.
 
-One message divergence: passing a non-iterable to a call, `f(*1)`, reports
+Passing a non-iterable to a call, `f(*1)`, reports
 `TypeError: Value after * must be an iterable, not int`, the same wording as a
 list literal. CPython instead names the callable by its module-qualified
 `__qualname__`: `__main__.f() argument after * must be an iterable, not int`,
 and correspondingly `__main__.C.m()`, `__main__.<lambda>()` or
 `__main__.outer.<locals>.inner()`. Monty has neither function `__qualname__`
 nor module-qualified names (see the class-name note in [collections.md](collections.md)), so
-it reports the generic form. Every other unpacking form matches CPython
-exactly, except for the comprehension target restriction in
-[comprehensions.md](comprehensions.md).
+it reports the generic form.
+
+Unpacking a named tuple into too few targets reports its total length, for example
+`ValueError: too many values to unpack (expected 1, got 2)`. CPython omits `got 2` for named tuples.
+
+See [comprehensions.md](comprehensions.md) for the comprehension target restriction.
 
 ## Source nesting depth
 
@@ -96,11 +92,26 @@ exactly, except for the comprehension target restriction in
 
 ## Imports
 
-- Only the bundled stdlib modules listed in [modules.md](modules.md) can be
-    imported. Importing anything else raises `ModuleNotFoundError`.
-- Relative imports (`from . import x`) raise `ImportError: "attempted relative import with no known parent package"`;
-    there is no package
-    system.
+- Imports can load bundled modules, [host modules](modules.md#host-modules) and
+    [modules from files](modules.md#modules-from-files).
+    Monty does not search the host Python installation.
+- Relative imports (`from . import x`, `from ..pkg import y`) resolve against the importing module's `__package__`,
+    else its `__name__` (less the last component unless `__path__` is set), as CPython does, with these differences:
+    - `__spec__` is never consulted, and falling back on `__name__` issues no `ImportWarning`.
+    - The main script and REPL feeds have no package, even if they assign `__package__`, so a relative import there
+        raises `ImportError: attempted relative import with no known parent package`.
+        `exec()` with an explicit globals dict reads that dict's `__package__` and `__name__`.
+    - Each component of the resolved package name must be a Python identifier and not a keyword.
+        For example, with `__package__ = 'my-plugin'`, `from . import x` raises `ModuleNotFoundError` even if the
+        package exists; CPython can import it.
+    - If neither `pkg` nor `pkg.sub` is loaded, `exec('from . import x', {'__package__': 'pkg.sub'})` raises
+        `ModuleNotFoundError` naming `pkg.sub` instead of importing `pkg` first as CPython does.
+        This can fail even when both packages exist, including when a previous import of those packages raised.
+    - If `pkg/__init__.py` imports `pkg.sibling` and then raises, a later `from .sibling import x` in a surviving
+        module of `pkg` can rerun the initializer, repeating its side effects or raising again.
+        CPython uses the cached `pkg.sibling` without rerunning the initializer.
+    - With `__package__ = 'os.path'`, `from .missing import x` reports `No module named 'posixpath.missing'` instead
+        of naming `os.path.missing` as CPython does.
 - `__import__` is not defined.
 
 ## `__future__` imports
@@ -258,10 +269,10 @@ another order (`Counter(a=x, b=x, c=x).most_common(2)` is
 
 ## What *does* work
 
-- Functions (`def`, `async def`), nested functions, closures, and decorators on
-    them, but not on methods (see above).
-- List / dict / set comprehensions; generator comprehensions degrade to
-    lists (see above).
+- Functions (`def`, `async def`), nested functions, closures, and decorators on functions and methods.
+- List, dict and set comprehensions and generator expressions.
+- Generator functions with `yield`, `yield from` and `send()`; see
+    [generators.md](generators.md).
 - `try` / `except` / `else` / `finally`, `raise ... from ...`.
 - `for` / `while` / `if` / `elif` / `else`, `break`, `continue`, `pass`,
     `assert`, `global`, `nonlocal`, `return`.

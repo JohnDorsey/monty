@@ -15,6 +15,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     heap::{ContainsHeap, DropGuard, HeapData, HeapId, HeapReadOutput, HeapReader},
+    intern::StaticStrings,
     os_dispatch::PostConversionEffect,
     types::{
         Dict, List, LongInt,
@@ -127,6 +128,10 @@ pub(super) fn call_load(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResul
                 CallResult::Value(text) => parse_owned(text, vm).map(CallResult::Value),
                 suspended => Ok(suspended),
             }
+        }
+        FileTarget::Stream(id) => {
+            let text = FileTarget::call_stream(id, StaticStrings::Read, ArgValues::Empty, vm)?;
+            parse_owned(text, vm).map(CallResult::Value)
         }
         FileTarget::Method(read) => {
             defer_drop!(read, vm);
@@ -332,8 +337,7 @@ fn parse_json_array(
     check_json_recursion_limit(jiter, depth)?;
 
     let Some(mut next) = jiter.known_array()? else {
-        let list_id = vm.heap.allocate(HeapData::List(List::new(Vec::new())));
-        return Ok(Value::Ref(list_id));
+        return Ok(Value::allocate(List::new(Vec::new()), vm.heap));
     };
 
     let values = Vec::new();
@@ -366,8 +370,7 @@ fn parse_json_array(
     }
 
     let values = values_guard.into_inner();
-    let list_id = vm.heap.allocate(HeapData::List(List::new(values)));
-    Ok(Value::Ref(list_id))
+    Ok(Value::allocate(List::new(values), vm.heap))
 }
 
 /// Parses a JSON string and immediately copies it into an owned `String`.
@@ -392,8 +395,7 @@ fn parse_json_object(
     check_json_recursion_limit(jiter, depth)?;
 
     let Some(mut key) = parse_first_object_key(jiter)? else {
-        let dict_id = vm.heap.allocate(HeapData::Dict(Dict::new()));
-        return Ok(Value::Ref(dict_id));
+        return Ok(Value::allocate(Dict::new(), vm.heap));
     };
 
     let mut dict_guard = DropGuard::new(Dict::new(), vm);
@@ -415,8 +417,7 @@ fn parse_json_object(
     }
 
     let dict = dict_guard.into_inner();
-    let dict_id = vm.heap.allocate(HeapData::Dict(dict));
-    Ok(Value::Ref(dict_id))
+    Ok(Value::allocate(dict, vm.heap))
 }
 
 /// Parses the first key of a JSON object and copies it into owned storage.

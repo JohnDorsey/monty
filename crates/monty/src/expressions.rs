@@ -1,6 +1,3 @@
-#[cfg(test)]
-use strum::IntoEnumIterator;
-
 use crate::{
     args::{ArgExprs, Kwarg, Signature},
     builtins::Builtins,
@@ -114,7 +111,7 @@ impl Identifier {
 pub struct Submodule {
     /// The attribute name (`b`).
     pub name: StringId,
-    /// The path through this component (`a.b`).
+    /// The path through this component (`a.b`); in a relative import it keeps the dots (`..a`).
     pub path: StringId,
 }
 
@@ -304,6 +301,10 @@ pub enum Expr {
     /// Raises `TypeError` for non-awaitable values.
     /// Unlike standard Python, `await` is allowed at module level (like Jupyter notebooks).
     Await(Box<ExprLoc>),
+    /// `yield value`: suspends the enclosing generator; evaluates to the value sent on resume.
+    Yield(Box<ExprLoc>),
+    /// `yield from iterable`: delegates to an iterator; evaluates to its `StopIteration` value.
+    YieldFrom(Box<ExprLoc>),
     /// F-string expression containing literal and interpolated parts.
     ///
     /// At evaluation time, each part is processed in sequence:
@@ -365,6 +366,8 @@ pub enum Expr {
         signature: ParsedSignature,
         /// The lambda body expression (not yet prepared).
         body: Box<ExprLoc>,
+        /// Whether the body contains `yield`, so calling the lambda creates a generator.
+        is_generator: bool,
     },
     /// Lambda expression: `lambda args: body` (prepared form).
     ///
@@ -389,6 +392,14 @@ pub enum Expr {
         target: Identifier,
         value: Box<ExprLoc>,
     },
+    /// A generator expression before its synthetic function scope is prepared.
+    GeneratorRaw {
+        name_id: StringId,
+        elt: Box<ExprLoc>,
+        generators: Vec<Comprehension>,
+    },
+    /// A generator expression with a prepared child scope.
+    Generator(Box<PreparedGeneratorExpression>),
 }
 
 /// Target for tuple unpacking - a name, attribute, subscript, nested tuple or
@@ -599,6 +610,17 @@ pub struct Comprehension {
     pub iter: ExprLoc,
     /// Zero or more filter conditions (all must be truthy for the element to be included).
     pub ifs: Vec<ExprLoc>,
+}
+
+/// A generator expression's synthetic function and comprehension clauses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedGeneratorExpression {
+    /// Scope and closure layout; the compiler builds the body from the clauses below.
+    pub func_def: PreparedFunctionDef,
+    pub elt: ExprLoc,
+    /// Only the first `iter` is evaluated in the enclosing scope.
+    pub generators: Vec<Comprehension>,
+    pub captured_slots: Vec<u16>,
 }
 
 impl Expr {
@@ -1000,6 +1022,9 @@ pub struct PreparedFunctionDef {
     /// When true, calling this function creates a `Coroutine` object instead of
     /// immediately pushing a frame.
     pub is_async: bool,
+    /// Whether the body yields: calling this function creates a `Generator` instead of
+    /// pushing a frame. Set from the parser's scope tracking, never inferred here.
+    pub is_generator: bool,
     /// The prepared `__annotate__(format)` of an annotated `def`, compiled as a
     /// nested function and recorded on the [`Function`](crate::function::Function).
     pub annotate: Option<Box<Self>>,
@@ -1053,7 +1078,9 @@ pub enum Operator {
 ///
 /// The strum `serialize` attribute on each variant is the source-level symbol,
 /// and drives both `Display` and [`as_str`](Self::as_str).
+#[monty_macros::explicit_discriminants(checksum = 0xd46b_2244_bab2_8bcb)]
 #[repr(u8)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 #[derive(
     Clone,
     Copy,
@@ -1062,7 +1089,6 @@ pub enum Operator {
     serde::Serialize,
     serde::Deserialize,
     strum::Display,
-    strum::EnumIter,
     strum::FromRepr,
     strum::IntoStaticStr,
 )]
@@ -1103,39 +1129,4 @@ impl CmpOperator {
     pub const fn as_operand(self) -> u8 {
         self as u8
     }
-}
-
-/// Computes an FNV-1a hash over comparison-operator identities and serialization.
-#[cfg(test)]
-pub(crate) fn comparison_operators_fingerprint() -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0100_0000_01b3;
-
-    fn update(hash: &mut u64, bytes: &[u8]) {
-        for byte in u32::try_from(bytes.len())
-            .expect("fingerprint field length fits u32")
-            .to_le_bytes()
-        {
-            *hash ^= u64::from(byte);
-            *hash = hash.wrapping_mul(PRIME);
-        }
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(PRIME);
-        }
-    }
-
-    let mut operators = CmpOperator::iter().collect::<Vec<_>>();
-    operators.sort_unstable_by_key(|operator| *operator as u8);
-    let mut hash = OFFSET_BASIS;
-    for operator in operators {
-        update(&mut hash, &[operator as u8]);
-        update(&mut hash, format!("{operator:?}").as_bytes());
-        update(&mut hash, operator.as_str().as_bytes());
-        update(
-            &mut hash,
-            &postcard::to_allocvec(&operator).expect("CmpOperator serialization cannot fail"),
-        );
-    }
-    hash
 }

@@ -2,9 +2,10 @@ use std::{
     borrow::Cow,
     fmt::{self, Display, Write},
     mem,
+    ops::{Deref, DerefMut},
 };
 
-use monty_types::{ExcData, JsonErrorData, MontyException, StackFrame, UnicodeErrorData};
+use monty_types::{ExcData, JsonErrorData, MontyException, StackFrame, UnicodeErrorData, UnicodeErrorObject};
 use smallvec::smallvec;
 
 use crate::{
@@ -12,13 +13,13 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     fstring::{FormatError, ascii_escape},
-    heap::{DropWithContext, HeapData, HeapId, HeapRead},
+    heap::{DropWithContext, HeapId, HeapRead},
     intern::{Interns, StaticStrings, StringId},
     parse::CodeRange,
     py_value::PyValue,
     source_map::{SourceMap, StackFrameExt},
     types::{
-        PyTrait, Type, TypeRef, allocate_tuple,
+        LazyHeapSet, PyTrait, Type, TypeRef, allocate_tuple,
         long_int::INT_MAX_STR_DIGITS,
         str::{StringRepr, allocate_string, string_repr_fmt},
     },
@@ -37,6 +38,21 @@ pub use monty_types::{ExcType, unicode_decode_error_msg};
 /// stay in `monty` as a `pub(crate)` extension trait with default bodies.
 /// Import the trait to call them as `ExcType::type_error(...)`.
 pub(crate) trait ExcTypeExt: Sized {
+    /// Mutation-only descriptors report the missing protocol hook by name.
+    fn attribute_error_descriptor_hook(name: &str) -> RunError {
+        SimpleException::new_msg(ExcType::AttributeError, name).into()
+    }
+
+    /// CPython names the property, when available, and the actual receiver's class.
+    fn attribute_error_property(name_repr: Option<&str>, owner: &str, accessor: &str) -> RunError {
+        let name = name_repr.map_or_else(String::new, |name| format!(" {name}"));
+        SimpleException::new_msg(
+            ExcType::AttributeError,
+            format!("property{name} of '{owner}' object has no {accessor}"),
+        )
+        .into()
+    }
+
     /// Creates an exception instance from an exception type and arguments,
     /// handling constructor calls like `ValueError('message')`.
     fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value>;
@@ -250,6 +266,38 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn cannot_reuse_already_awaited_coroutine() -> RunError {
         SimpleException::new_msg(ExcType::RuntimeError, "cannot reuse already awaited coroutine").into()
+    }
+
+    /// Creates the canonical `RuntimeError: cannot reuse already awaited future`,
+    /// raised when an already-consumed future or task is awaited again.
+    #[must_use]
+    fn cannot_reuse_already_awaited_future() -> RunError {
+        SimpleException::new_msg(ExcType::RuntimeError, "cannot reuse already awaited future").into()
+    }
+
+    /// `RuntimeError: coroutine is being awaited already` — a second task
+    /// awaiting a coroutine-like awaitable that another await is still driving.
+    #[must_use]
+    fn coroutine_being_awaited_already() -> RunError {
+        SimpleException::new_msg(ExcType::RuntimeError, "coroutine is being awaited already").into()
+    }
+
+    /// `ValueError: Set of Tasks/Futures is empty.` — `asyncio.wait` given no inputs.
+    #[must_use]
+    fn wait_empty_input() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "Set of Tasks/Futures is empty.").into()
+    }
+
+    /// `AttributeError: '<type>' object has no attribute 'add_done_callback'` —
+    /// an `asyncio.wait` input that is neither a task nor a future. CPython
+    /// fails on the first callback it tries to attach.
+    #[must_use]
+    fn wait_input_not_future(type_name: &str) -> RunError {
+        SimpleException::new_msg(
+            ExcType::AttributeError,
+            format!("'{type_name}' object has no attribute 'add_done_callback'"),
+        )
+        .into()
     }
 
     /// `ValueError: generator already executing` — a generator advanced from
@@ -1080,6 +1128,12 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::TypeError, msg).into()
     }
 
+    /// The buffer protocol's type error for an unsupported argument.
+    #[must_use]
+    fn type_error_bytes_like(type_name: impl fmt::Display) -> RunError {
+        Self::type_error(format_args!("a bytes-like object is required, not '{type_name}'"))
+    }
+
     /// Creates the TypeError raised when a `with` statement's context expression
     /// does not implement the context-manager protocol.
     ///
@@ -1119,7 +1173,7 @@ pub(crate) trait ExcTypeExt: Sized {
             Ok(repr_value) => {
                 defer_drop!(repr_value, vm);
                 repr_value
-                    .try_to_str(vm)
+                    .try_as_str(vm)
                     .map_or_else(|_| format!("<{}>", key.py_type_name(vm)), str::to_owned)
             }
             Err(err) => return err,
@@ -1134,6 +1188,11 @@ pub(crate) trait ExcTypeExt: Sized {
     /// Creates a generic `ValueError` with a custom message.
     fn value_error(msg: impl fmt::Display) -> RunError {
         SimpleException::new_msg(ExcType::ValueError, msg).into()
+    }
+
+    /// A datetime or time component outside Python's non-leap-second range.
+    fn second_out_of_range(second: impl fmt::Display) -> RunError {
+        Self::value_error(format_args!("second must be in 0..59, not {second}"))
     }
 
     /// Creates a generic `IndexError` with a custom message.
@@ -1174,6 +1233,27 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn mktime_out_of_range() -> RunError {
         SimpleException::new_msg(ExcType::OverflowError, "mktime argument out of range").into()
+    }
+
+    /// `strptime()`'s `ValueError` for a directive missing from its table, quoted
+    /// with bare `'` as CPython does: `'{directive}' is a bad directive in format '{format}'`.
+    #[must_use]
+    fn strptime_bad_directive(directive: &str, format: &str) -> RunError {
+        Self::value_error(format_args!("'{directive}' is a bad directive in format '{format}'"))
+    }
+
+    /// `strptime()`'s `ValueError` for a `%` with nothing, or only whitespace,
+    /// after it: `stray % in format '{format}'`.
+    #[must_use]
+    fn strptime_stray_percent(format: &str) -> RunError {
+        Self::value_error(format_args!("stray % in format '{format}'"))
+    }
+
+    /// The `ValueError` the `time` conversion functions raise for a time tuple
+    /// field outside its range: `{field} out of range`.
+    #[must_use]
+    fn time_field_out_of_range(field: &str) -> RunError {
+        Self::value_error(format_args!("{field} out of range"))
     }
 
     /// The `TypeError` the `time` conversion functions raise for a time tuple of
@@ -1550,6 +1630,15 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::RuntimeError, "Set changed size during iteration").into()
     }
 
+    /// Creates the RuntimeError a `StopIteration` escaping a generator or coroutine
+    /// becomes (PEP 479); `kind` is `generator` or `coroutine`.
+    ///
+    /// Matches CPython's format: `RuntimeError: generator raised StopIteration`
+    #[must_use]
+    fn runtime_error_raised_stop_iteration(kind: &str) -> RunError {
+        SimpleException::new_msg(ExcType::RuntimeError, format!("{kind} raised StopIteration")).into()
+    }
+
     /// Creates a TypeError for functions that don't accept keyword arguments.
     ///
     /// Matches CPython's `PyArg_NoKeywords` format: `TypeError: {name}() takes
@@ -1864,6 +1953,19 @@ pub(crate) trait ExcTypeExt: Sized {
         ))
     }
 
+    /// The `ImportError` for a relative import in a module with no `__package__`,
+    /// such as the main script or a top-level module.
+    #[must_use]
+    fn relative_import_no_parent() -> RunError {
+        import_error_without_caret("attempted relative import with no known parent package".to_owned())
+    }
+
+    /// The `ImportError` for a relative import with more dots than `__package__` has components.
+    #[must_use]
+    fn relative_import_beyond_top_level() -> RunError {
+        import_error_without_caret("attempted relative import beyond top-level package".to_owned())
+    }
+
     /// The `TypeError` for a non-`str` name `from module import *` would bind:
     /// an item of `__all__`, or a key of the module's namespace without one.
     /// Like every star-import error, CPython shows it without carets.
@@ -2037,6 +2139,18 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn overflow_c_long() -> RunError {
         SimpleException::new_msg(ExcType::OverflowError, "Python int too large to convert to C long").into()
+    }
+
+    /// CPython's `i` format for an `i64` outside a C `int`:
+    /// `signed integer is less than minimum` / `signed integer is greater than maximum`.
+    #[must_use]
+    fn overflow_signed_c_int(value: i64) -> RunError {
+        let msg = if value < 0 {
+            "signed integer is less than minimum"
+        } else {
+            "signed integer is greater than maximum"
+        };
+        SimpleException::new_msg(ExcType::OverflowError, msg).into()
     }
 
     /// `OverflowError: Python int too large for C unsigned long`, from Argument
@@ -2231,6 +2345,74 @@ pub(crate) trait ExcTypeExt: Sized {
             format!("sequence item {index}: expected str instance, {item_type} found"),
         )
         .into()
+    }
+
+    /// Creates a TypeError for `str.translate()` when a mapping returns something other than an int, `None` or str.
+    ///
+    /// Matches CPython's format: `TypeError: character mapping must return integer, None or str`
+    #[must_use]
+    fn type_error_translate_value() -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, "character mapping must return integer, None or str").into()
+    }
+
+    /// Creates a ValueError for `str.translate()` when a mapped int is not a code point.
+    ///
+    /// Matches CPython's format: `ValueError: character mapping must be in range(0x110000)`
+    #[must_use]
+    fn value_error_translate_range() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "character mapping must be in range(0x110000)").into()
+    }
+
+    /// Creates a ValueError for `str.maketrans(x, y)` when `x` and `y` differ in length.
+    ///
+    /// Matches CPython's format: `ValueError: the first two maketrans arguments must have equal length`
+    #[must_use]
+    fn value_error_maketrans_lengths() -> RunError {
+        SimpleException::new_msg(
+            ExcType::ValueError,
+            "the first two maketrans arguments must have equal length",
+        )
+        .into()
+    }
+
+    /// Creates a ValueError for a `str.maketrans(dict)` key that is not one character long (typo is CPython's).
+    ///
+    /// Matches CPython's format: `ValueError: string keys in translatetable must be of length 1`
+    #[must_use]
+    fn value_error_maketrans_key_length() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "string keys in translatetable must be of length 1").into()
+    }
+
+    /// Creates a TypeError for `str.maketrans(x)` when `x` is not a dict.
+    ///
+    /// Matches CPython's format: `TypeError: if you give only one argument to maketrans it must be a dict`
+    #[must_use]
+    fn type_error_maketrans_dict() -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            "if you give only one argument to maketrans it must be a dict",
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for `str.maketrans(x, y)` when `x` is not a str.
+    ///
+    /// Matches CPython's format: `TypeError: first maketrans argument must be a string if there is a second argument`
+    #[must_use]
+    fn type_error_maketrans_first_str() -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            "first maketrans argument must be a string if there is a second argument",
+        )
+        .into()
+    }
+
+    /// Creates a TypeError for a `str.maketrans(dict)` key that is neither a str nor an int (typo is CPython's).
+    ///
+    /// Matches CPython's format: `TypeError: keys in translate table mustbe strings or integers`
+    #[must_use]
+    fn type_error_maketrans_key_type() -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, "keys in translate table mustbe strings or integers").into()
     }
 
     /// Creates a TypeError for str.join() when the argument is not iterable.
@@ -2753,6 +2935,115 @@ pub(crate) trait ExcTypeExt: Sized {
         )
         .into()
     }
+
+    /// `ValueError: I/O operation on closed file.` — the wording of `IOBase`
+    /// methods and of `BytesIO`, `open()` files and text-mode reads.
+    #[must_use]
+    fn value_error_closed_file() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "I/O operation on closed file.").into()
+    }
+
+    /// `ValueError: I/O operation on closed file` — no full stop, as
+    /// `StringIO`'s own methods word it.
+    #[must_use]
+    fn value_error_closed_string_io() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "I/O operation on closed file").into()
+    }
+
+    /// `io.UnsupportedOperation: {message}`, e.g. `fileno` on an in-memory stream or
+    /// `read()` on a write-only `open()` file.
+    #[must_use]
+    fn unsupported_operation(message: &str) -> RunError {
+        SimpleException::new_msg(ExcType::UnsupportedOperation, message).into()
+    }
+
+    /// `TypeError: argument should be integer or None, not 'X'` — CPython's
+    /// `_Py_convert_optional_to_ssize_t`, behind the io `size` arguments.
+    #[must_use]
+    fn type_error_integer_or_none(type_: &str) -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            format!("argument should be integer or None, not '{type_}'"),
+        )
+        .into()
+    }
+
+    /// `TypeError: integer argument expected, got 'X'` — `BytesIO.readlines(hint)`.
+    #[must_use]
+    fn type_error_integer_argument_expected(type_: &str) -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, format!("integer argument expected, got '{type_}'")).into()
+    }
+
+    /// `TypeError: a bytes-like object is required, not 'X'`.
+    #[must_use]
+    fn type_error_bytes_like_required(type_: &str) -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            format!("a bytes-like object is required, not '{type_}'"),
+        )
+        .into()
+    }
+
+    /// `TypeError: string argument expected, got 'X'` — `StringIO.write()`.
+    #[must_use]
+    fn type_error_string_argument_expected(type_: &str) -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, format!("string argument expected, got '{type_}'")).into()
+    }
+
+    /// `TypeError: {arg} must be str or None, not X` — `StringIO()`'s
+    /// `initial_value` and `newline`.
+    #[must_use]
+    fn type_error_str_or_none(arg: &str, type_: &str) -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, format!("{arg} must be str or None, not {type_}")).into()
+    }
+
+    /// `ValueError: illegal newline value: 'x'`.
+    #[must_use]
+    fn value_error_illegal_newline(value: &str) -> RunError {
+        SimpleException::new_msg(
+            ExcType::ValueError,
+            format!("illegal newline value: {}", StringRepr(value)),
+        )
+        .into()
+    }
+
+    /// `ValueError: Invalid whence (N, should be 0, 1 or 2)` (`StringIO`), or
+    /// the lower-case `invalid whence` `BytesIO` uses.
+    #[must_use]
+    fn value_error_invalid_whence(whence: i64, capitalised: bool) -> RunError {
+        let word = if capitalised { "Invalid" } else { "invalid" };
+        SimpleException::new_msg(
+            ExcType::ValueError,
+            format!("{word} whence ({whence}, should be 0, 1 or 2)"),
+        )
+        .into()
+    }
+
+    /// `OSError: Can't do nonzero cur-relative seeks` — a text stream's
+    /// `seek()` with a nonzero offset from the current position or the end.
+    #[must_use]
+    fn os_error_nonzero_relative_seek() -> RunError {
+        SimpleException::new_msg(ExcType::OSError, "Can't do nonzero cur-relative seeks").into()
+    }
+
+    /// `OverflowError: new position too large` — `BytesIO.seek()` or a `StringIO`
+    /// write past `ssize_t`.
+    #[must_use]
+    fn overflow_new_position_too_large() -> RunError {
+        SimpleException::new_msg(ExcType::OverflowError, "new position too large").into()
+    }
+
+    /// `OverflowError: new buffer size too large` — a `BytesIO` write ending past `ssize_t`.
+    #[must_use]
+    fn overflow_new_buffer_size_too_large() -> RunError {
+        SimpleException::new_msg(ExcType::OverflowError, "new buffer size too large").into()
+    }
+
+    /// `TypeError: {name}() takes no arguments`, without the count `type_error_no_args` adds.
+    #[must_use]
+    fn type_error_takes_no_arguments(name: &str) -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, format!("{name}() takes no arguments")).into()
+    }
 }
 
 /// The constructor of every native exception class, for the native type table.
@@ -2766,6 +3057,9 @@ impl ExcTypeExt for ExcType {
     /// Allocates an exception for constructors like `ValueError('message')`.
     /// Currently supports zero or one string argument.
     fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+        if self == Self::StopIteration {
+            return stop_iteration_call(vm, args);
+        }
         defer_drop!(args, vm);
         let exc = match args {
             ArgValues::Empty => Ok(SimpleException::new_none(self)),
@@ -2779,8 +3073,82 @@ impl ExcTypeExt for ExcType {
                 "exceptions can only be called with zero or one string argument",
             )),
         }?;
-        let heap_id = vm.heap.allocate(HeapData::Exception(exc));
-        Ok(Value::Ref(heap_id))
+        Ok(Value::allocate(ExceptionValue::from(exc), vm.heap))
+    }
+}
+
+/// `StopIteration(value)` keeps any one argument as its `value`, the way a
+/// generator's `return value` does; a string also becomes the message.
+fn stop_iteration_call(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let value = match args {
+        ArgValues::Empty => None,
+        ArgValues::One(value) => Some(value),
+        args => {
+            args.drop_with(vm);
+            return Err(RunError::internal(
+                "StopIteration can only be called with zero or one argument",
+            ));
+        }
+    };
+    let message = match value.as_ref().map(|value| value.py_value(vm)) {
+        Some(PyValue::Str(string)) => Some(string.as_str(vm).to_owned()),
+        _ => None,
+    };
+    let exception = SimpleException::new(ExcType::StopIteration, message);
+    Ok(Value::allocate(
+        ExceptionValue {
+            exception,
+            value: value.map(Box::new),
+        },
+        vm.heap,
+    ))
+}
+
+/// A heap-resident exception: the exception itself, plus the arbitrary value a
+/// `StopIteration` carries, which a [`SimpleException`] cannot own.
+///
+/// The value keeps its identity, so `return obj` in a generator reaches
+/// `except StopIteration as e: e.value is obj`. Flattened so dumps written
+/// before the value existed still load.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExceptionValue {
+    #[serde(flatten)]
+    pub(crate) exception: SimpleException,
+    /// Owned: the `StopIteration.value`, `None` when it was never given. Boxed
+    /// so the payload stays inside `HeapData`'s 64-bit size.
+    #[serde(rename = "V", default, skip_serializing_if = "Option::is_none")]
+    pub(crate) value: Option<Box<Value>>,
+}
+
+impl ExceptionValue {
+    /// A new reference to `StopIteration.value`: the stored value, else the message
+    /// of one built from text alone (raised by the host), else `None`.
+    pub(crate) fn stop_iteration_value(&self, vm: &VM<'_>) -> Value {
+        match (&self.value, &self.exception.arg) {
+            (Some(value), _) => value.clone_with_heap(vm.heap),
+            (None, Some(message)) => allocate_string(message.as_str(), vm.heap),
+            (None, None) => Value::None,
+        }
+    }
+}
+
+impl From<SimpleException> for ExceptionValue {
+    fn from(exception: SimpleException) -> Self {
+        Self { exception, value: None }
+    }
+}
+
+impl Deref for ExceptionValue {
+    type Target = SimpleException;
+
+    fn deref(&self) -> &SimpleException {
+        &self.exception
+    }
+}
+
+impl DerefMut for ExceptionValue {
+    fn deref_mut(&mut self) -> &mut SimpleException {
+        &mut self.exception
     }
 }
 
@@ -2972,27 +3340,68 @@ impl SimpleException {
     }
 }
 
-impl<'h> HeapRead<'h, SimpleException> {
+impl<'h> HeapRead<'h, ExceptionValue> {
     pub(crate) fn py_type(&self, vm: &VM<'h>) -> TypeRef {
         Type::from(self.get(vm.heap).exc_type).into()
     }
 
-    /// Gets an attribute from this exception: `args` (a tuple of the message, if
-    /// any), `__cause__`, `__context__` and `__suppress_context__`. Returns `None`
-    /// for all other attributes.
+    /// Gets an attribute from this exception: `args` (a tuple of the message or
+    /// `StopIteration` value, if any), `__cause__`, `__context__`,
+    /// `__suppress_context__` and `StopIteration.value`. Returns `None` for all
+    /// other attributes.
     pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> Option<CallResult> {
-        // Interned names match by ID; only `args` can also arrive as a dynamic string.
-        let name = attr.static_string(vm.interns);
+        // Interned names match by ID; `args` and `value` can also arrive as dynamic strings.
+        let name = attr
+            .static_string(vm.interns)
+            .or_else(|| match attr.as_str(vm.interns) {
+                "args" => Some(StaticStrings::Args),
+                "value" => Some(StaticStrings::Value),
+                _ => None,
+            });
         let exc = self.get(vm.heap);
         let value = match name {
             Some(StaticStrings::DunderCause) => chained_value(exc.cause(), vm),
             Some(StaticStrings::DunderContext) => chained_value(exc.context(), vm),
             Some(StaticStrings::DunderSuppressContext) => Value::Bool(exc.suppress_context()),
-            Some(StaticStrings::Args) => args_tuple(exc.arg.as_deref(), vm),
-            None if attr.as_str(vm.interns) == "args" => args_tuple(exc.arg.as_deref(), vm),
+            Some(StaticStrings::Args) => match &exc.value {
+                Some(value) => allocate_tuple(smallvec![value.clone_with_heap(vm.heap)], vm.heap),
+                None => args_tuple(exc.arg.as_deref(), vm),
+            },
+            Some(StaticStrings::Value) if exc.exc_type == ExcType::StopIteration => exc.stop_iteration_value(vm),
             _ => return None,
         };
         Some(CallResult::Value(value))
+    }
+
+    /// `repr(exc)`, formatting a `StopIteration` value with its own `repr`.
+    pub(crate) fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
+        let Some(value) = self.stop_value(vm) else {
+            return Ok(self.get(vm.heap).exception.py_repr_fmt(f)?);
+        };
+        defer_drop!(value, vm);
+        // The value can hold the exception itself, or nest exceptions arbitrarily deep.
+        let mut guard = vm.recursion_guard()?;
+        f.write_str("StopIteration(")?;
+        value.py_repr_fmt(f, &mut guard, heap_ids)?;
+        Ok(f.write_char(')')?)
+    }
+
+    /// `str(exc)`: a `StopIteration` value's own `str`, else the message.
+    pub(crate) fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        let Some(value) = self.stop_value(vm) else {
+            return Ok(allocate_string(self.get(vm.heap).exception.py_str(), vm.heap));
+        };
+        defer_drop!(value, vm);
+        let mut guard = vm.recursion_guard()?;
+        value.py_str(&mut guard)
+    }
+
+    /// A new reference to the `StopIteration` value, released before it is formatted.
+    fn stop_value(&self, vm: &VM<'h>) -> Option<Value> {
+        self.get(vm.heap)
+            .value
+            .as_ref()
+            .map(|value| value.clone_with_heap(vm.heap))
     }
 }
 
@@ -3055,6 +3464,20 @@ impl From<MontyException> for ExceptionRaise {
 }
 
 impl ExceptionRaise {
+    /// Heap bytes a clone allocates for the message, structured payload, and frames.
+    fn clone_allocation_size(&self) -> usize {
+        self.exc
+            .arg()
+            .map_or(0, String::len)
+            .saturating_add(exc_data_clone_size(&self.exc.data))
+            .saturating_add(self.frame.as_ref().map_or(0, RawStackFrame::clone_allocation_size))
+            .saturating_add(self.snippet_frame.as_ref().map_or(0, |frame| {
+                mem::size_of::<StackFrame>()
+                    .saturating_add(frame.filename.len())
+                    .saturating_add(frame.frame_name.as_ref().map_or(0, String::len))
+            }))
+    }
+
     /// Adds a caller's frame as the outermost frame in the traceback chain.
     ///
     /// This is used when an exception propagates up through call frames.
@@ -3146,6 +3569,23 @@ impl ExceptionRaise {
     }
 }
 
+/// Heap bytes a clone of `data` allocates for its boxed structured payload.
+fn exc_data_clone_size(data: &ExcData) -> usize {
+    match data {
+        ExcData::None => 0,
+        ExcData::Unicode(data) => mem::size_of::<UnicodeErrorData>()
+            .saturating_add(data.encoding.len())
+            .saturating_add(data.reason.len())
+            .saturating_add(match &data.object {
+                UnicodeErrorObject::Bytes(bytes) => bytes.len(),
+                UnicodeErrorObject::Str(text) => text.len(),
+            }),
+        ExcData::Json(data) => mem::size_of::<JsonErrorData>()
+            .saturating_add(data.msg.len())
+            .saturating_add(data.doc.as_ref().map_or(0, String::len)),
+    }
+}
+
 /// A stack frame for traceback information.
 ///
 /// Stores position information and optional function name as StringId.
@@ -3165,6 +3605,11 @@ pub struct RawStackFrame {
 }
 
 impl RawStackFrame {
+    /// Heap bytes a clone allocates for this frame and its boxed parents.
+    fn clone_allocation_size(&self) -> usize {
+        mem::size_of::<Self>().saturating_add(self.parent.as_ref().map_or(0, |parent| parent.clone_allocation_size()))
+    }
+
     pub(crate) fn new(position: CodeRange, frame_name: StringId, parent: Option<&Self>) -> Self {
         Self {
             position,
@@ -3249,6 +3694,17 @@ impl From<fmt::Error> for RunError {
 }
 
 impl RunError {
+    /// Heap bytes a clone allocates for its exception payload, excluding the inline value.
+    pub(crate) fn clone_allocation_size(&self) -> usize {
+        match self {
+            Self::Internal(message) => match message {
+                Cow::Borrowed(_) => 0,
+                Cow::Owned(message) => message.len(),
+            },
+            Self::Exc(exc) | Self::UncatchableExc(exc) => exc.clone_allocation_size(),
+        }
+    }
+
     /// Whether this is a catchable `exc_type`, matching only `Exc` so an uncatchable
     /// host or resource error is never swallowed by a guard that expects one.
     pub(crate) fn is_catchable(&self, exc_type: ExcType) -> bool {

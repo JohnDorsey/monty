@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp::Ordering, fmt};
+use std::{borrow::Cow, cmp::Ordering, fmt, mem};
 
 use ahash::AHashSet;
 use monty_types::{FormatComplex, FormatFloat, MontyException, StackFrame, StringRepr, bytes_repr};
@@ -17,6 +17,7 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::{
     args::{ArgExprs, CallArg, CallKwarg, Kwarg},
+    builtins::{Builtins, BuiltinsFunctions},
     exception_private::{ExcType, ExcTypeExt, ExceptionRaise, RunError, SimpleException},
     expressions::{
         AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, ImportName, Literal,
@@ -147,6 +148,8 @@ pub struct RawFunctionDef {
     pub body: Vec<ParseNode>,
     /// Whether this is an async function (`async def`).
     pub is_async: bool,
+    /// Whether the body contains `yield` in its own scope, making a call create a generator.
+    pub is_generator: bool,
     /// The `__annotate__(format)` function of an annotated `def` (PEP 649), built by
     /// [`Parser::synthesize_annotate`]; `None` when nothing is annotated.
     pub annotate: Option<Box<Self>>,
@@ -358,7 +361,7 @@ pub(crate) fn source_nesting_exception(
 /// as `1+1+...` builds one deep enough to overflow the stack.
 ///
 /// # Errors
-/// The `SyntaxError: Source is too deeply nested` located in the source.
+/// A located `SyntaxError` if source exceeds `u32::MAX` UTF-8 bytes or its nesting/depth limit.
 pub fn type_check_nesting_exception(
     code: &str,
     script_name: &str,
@@ -374,16 +377,29 @@ pub fn type_check_nesting_exception(
     }
 }
 
-/// Rejects a source over `source_scan_threshold` bytes whose estimated parser
-/// nesting exceeds [`MAX_NESTING_DEPTH`] before ruff can grow its stack on it.
-///
-/// Same message as the converter's exact check, so either path reads alike.
+/// Rejects source lengths that Ruff's 32-bit offsets cannot represent.
+pub(crate) fn check_source_length(byte_len: usize, filename_id: StringId) -> Result<(), ParseError> {
+    u32::try_from(byte_len).map(|_| ()).map_err(|_| {
+        ParseError::syntax(
+            "source exceeds maximum length of 4294967295 bytes",
+            CodeRange {
+                filename: filename_id,
+                ..CodeRange::default()
+            },
+        )
+    })
+}
+
+/// Rejects source above `u32::MAX` bytes regardless of `source_scan_threshold`.
+/// Sources above `source_scan_threshold` also get a nesting check against [`MAX_NESTING_DEPTH`].
 fn check_source_nesting(
     code: &str,
     mode: Mode,
     filename_id: StringId,
     source_scan_threshold: usize,
 ) -> Result<(), ParseError> {
+    check_source_length(code.len(), filename_id)?;
+
     if code.len() > source_scan_threshold
         && let Some(range) = nesting_bound_exceeded(code, mode, MAX_NESTING_DEPTH)
     {
@@ -421,6 +437,36 @@ pub struct Parser<'a, 'i> {
     /// Whether a `__future__` import may still appear: only a docstring and
     /// other `__future__` imports precede one, at module level.
     future_allowed: bool,
+    /// Where a `yield` parsed now would bind; see [`YieldScope`].
+    yield_scope: YieldScope,
+    comprehension: ComprehensionContext,
+}
+
+/// Syntax restrictions inherited through nested comprehensions.
+#[derive(Default)]
+struct ComprehensionContext {
+    /// Assignment expressions are forbidden here, even in nested scopes.
+    in_iterable: bool,
+    /// An `await` here would make a generator expression asynchronous.
+    in_generator: bool,
+}
+
+/// The scope a `yield` would belong to, tracked so the enclosing `def` or `lambda`
+/// learns it is a generator and misplaced yields get CPython's `SyntaxError`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YieldScope {
+    /// Module or class body, where `yield` is an error.
+    Outside,
+    /// A `def` or `lambda` body; `yields` records whether one has been seen, and
+    /// `is_async` rejects `yield from`.
+    Function {
+        yields: bool,
+        is_async: bool,
+    },
+    /// A comprehension's own scope, named for the error message. Its first
+    /// iterable is evaluated in the enclosing scope, so it is not in here.
+    Comprehension(&'static str),
+    GeneratorExpression,
 }
 
 impl<'a, 'i> Parser<'a, 'i> {
@@ -439,6 +485,8 @@ impl<'a, 'i> Parser<'a, 'i> {
             class_keyword_offsets,
             future_annotations,
             future_allowed: true,
+            yield_scope: YieldScope::Outside,
+            comprehension: ComprehensionContext::default(),
         }
     }
 
@@ -722,10 +770,30 @@ impl<'a, 'i> Parser<'a, 'i> {
                 Some(value) => Some(self.parse_expression(*value)?),
                 None => None,
             })),
-            Stmt::Delete(d) => Err(ParseError::not_implemented(
-                "the 'del' statement",
-                self.convert_range(d.range),
-            )),
+            Stmt::Delete(d) => {
+                let position = self.convert_range(d.range);
+                let mut targets = d.targets.into_iter();
+                let Some(AstExpr::Attribute(ast::ExprAttribute { value, attr, range, .. })) = targets.next() else {
+                    return Err(ParseError::not_implemented("the 'del' statement", position));
+                };
+                if targets.next().is_some() {
+                    return Err(ParseError::not_implemented("multiple del targets", position));
+                }
+                let object = self.parse_expression(*value)?;
+                let name = self.interner.intern(attr.id());
+                // CPython underlines the deleted attribute, excluding the `del` keyword.
+                let target_position = self.convert_range(range);
+                Ok(Node::Expr(ExprLoc::new(
+                    target_position,
+                    Expr::Call {
+                        callable: Callable::Builtin(Builtins::Function(BuiltinsFunctions::Delattr)),
+                        args: Box::new(ArgExprs::Two(
+                            object,
+                            ExprLoc::new(position, Expr::Literal(Literal::Str(name))),
+                        )),
+                    },
+                )))
+            }
             Stmt::TypeAlias(t) => Err(ParseError::not_implemented("type aliases", self.convert_range(t.range))),
             Stmt::Assign(ast::StmtAssign {
                 mut targets,
@@ -958,7 +1026,7 @@ impl<'a, 'i> Parser<'a, 'i> {
                 let import_names = names
                     .iter()
                     .map(|alias_node| {
-                        let (module_name, submodules) = self.import_path(&alias_node.name, position)?;
+                        let (module_name, submodules) = self.import_path("", &alias_node.name, position)?;
                         // `import a.b` loads `a.b` but binds `a`; an alias binds `a.b` itself.
                         let binds_top_level = alias_node.asname.is_none() && !submodules.is_empty();
                         // The binding name is the alias if present, otherwise the module
@@ -990,7 +1058,7 @@ impl<'a, 'i> Parser<'a, 'i> {
                 // to a no-op, so real-world modules import cleanly. Anything Monty
                 // does not implement is rejected rather than quietly failing to do
                 // what it says. `level == 0` keeps `from .__future__ import x` an
-                // ordinary relative import, falling through to the `ImportError`.
+                // ordinary relative import.
                 if level == 0 && module.as_ref().is_some_and(|m| m.as_str() == "__future__") {
                     if !self.future_allowed {
                         return Err(ParseError::syntax(
@@ -1031,25 +1099,10 @@ impl<'a, 'i> Parser<'a, 'i> {
                         }
                     };
                 }
-                // We only support absolute imports (level 0)
-                // TODO(site-packages): relative imports in modules imported from files,
-                // resolved against the importing module's `__package__`.
-                if level != 0 {
-                    return Err(ParseError::import_error(
-                        "attempted relative import with no known parent package",
-                        position,
-                    ));
-                }
-                // Module name is required for absolute imports
-                let (module_name, submodules) = match module {
-                    Some(m) => self.import_path(&m, position)?,
-                    None => {
-                        return Err(ParseError::import_error(
-                            "attempted relative import with no known parent package",
-                            position,
-                        ));
-                    }
-                };
+                // For `..pkg.mod`, the VM resolves `..` against the importing module's `__package__`.
+                let dots = ".".repeat(level as usize);
+                let module = module.as_ref().map_or("", |m| m.as_str());
+                let (module_name, submodules) = self.import_path(&dots, module, position)?;
                 // The grammar only allows `*` as the sole imported name.
                 if let [alias] = names.as_slice()
                     && alias.name.as_str() == "*"
@@ -1120,8 +1173,7 @@ impl<'a, 'i> Parser<'a, 'i> {
     /// Shared by the top-level `Stmt::FunctionDef` arm and by class-body method
     /// parsing in [`parse_class_def`](Self::parse_class_def). The decorators are
     /// returned separately because they belong to the statement, not the function
-    /// (see [`Node::FunctionDef`]); the class-body path rejects decorated methods
-    /// before calling here, so it always receives an empty list.
+    /// (see [`Node::FunctionDef`]). Class-body methods use the same decorator path.
     fn parse_function_def(
         &mut self,
         mut function: ast::StmtFunctionDef,
@@ -1165,9 +1217,15 @@ impl<'a, 'i> Parser<'a, 'i> {
                 name.position,
             )?))
         };
-        // Parse function body recursively
-        let body = self.parse_statements(function.body)?;
+        // Parse function body recursively, recording whether its own scope yields.
         let is_async = function.is_async;
+        let (body, is_generator) = self.in_function_scope(is_async, |parser| parser.parse_statements(function.body))?;
+        if is_async && is_generator {
+            return Err(ParseError::not_implemented(
+                "async generator functions",
+                self.convert_range(function.range),
+            ));
+        }
 
         Ok((
             RawFunctionDef {
@@ -1175,6 +1233,7 @@ impl<'a, 'i> Parser<'a, 'i> {
                 signature,
                 body,
                 is_async,
+                is_generator,
                 annotate,
                 is_annotate: false,
             },
@@ -1268,6 +1327,7 @@ impl<'a, 'i> Parser<'a, 'i> {
             },
             body,
             is_async: false,
+            is_generator: false,
             annotate: None,
             is_annotate: true,
         })
@@ -1385,29 +1445,23 @@ impl<'a, 'i> Parser<'a, 'i> {
         // StaticStrings::DunderClass even if no method body explicitly mentions the identifier.
         self.interner.intern("__class__");
 
+        // A class body cannot yield, even inside a function; methods open their own scope.
+        // Not restored on error, which abandons the whole parse.
+        let outer_yield_scope = mem::replace(&mut self.yield_scope, YieldScope::Outside);
         for (i, stmt) in class.body.into_iter().enumerate() {
             match stmt {
                 Stmt::FunctionDef(function) => {
-                    if !function.decorator_list.is_empty() {
-                        return Err(ParseError::not_implemented(
-                            "method decorators (classmethod/staticmethod/property)",
-                            self.convert_range(function.range),
-                        ));
-                    }
-                    // Parameter defaults evaluate in the class-body scope, so a
-                    // walrus target there would become a class member (see
-                    // `reject_class_body_walrus`); walrus in the method *body*
-                    // binds in the method scope and is fine.
+                    // Defaults and decorators run in class-body scope; a walrus there
+                    // would bind a class member. Walruses in method bodies remain local.
                     for param in function.parameters.iter_non_variadic_params() {
                         if let Some(default) = &param.default {
                             self.reject_class_body_walrus(default)?;
                         }
                     }
+                    for decorator in &function.decorator_list {
+                        self.reject_class_body_walrus(&decorator.expression)?;
+                    }
                     let (method, decorators) = self.parse_function_def(function)?;
-                    // Rejected above, so a decorated method never reaches the
-                    // class namespace — where a decorator's return value, not a
-                    // function, would end up bound as the member.
-                    debug_assert!(decorators.is_empty(), "method decorators are rejected above");
                     members.push(method.name);
                     body.push(Node::FunctionDef {
                         def: method,
@@ -1498,6 +1552,7 @@ impl<'a, 'i> Parser<'a, 'i> {
                 }
             }
         }
+        self.yield_scope = outer_yield_scope;
 
         // The synthesized `__doc__` binding runs first (like CPython's docstring
         // store); the namespace assembly loads final local values, so an explicit
@@ -1553,6 +1608,7 @@ impl<'a, 'i> Parser<'a, 'i> {
             signature: ParsedSignature::default(),
             body,
             is_async: false,
+            is_generator: false,
             annotate: None,
             is_annotate: false,
         };
@@ -1807,6 +1863,12 @@ impl<'a, 'i> Parser<'a, 'i> {
             AstExpr::Named(ast::ExprNamed {
                 target, value, range, ..
             }) => {
+                if self.comprehension.in_iterable {
+                    return Err(ParseError::syntax(
+                        "assignment expression cannot be used in a comprehension iterable expression",
+                        self.convert_range(range),
+                    ));
+                }
                 let target_ident = self.parse_identifier(*target)?;
                 let value_expr = self.parse_expression(*value)?;
                 Ok(ExprLoc::new(
@@ -1889,15 +1951,16 @@ impl<'a, 'i> Parser<'a, 'i> {
                     ParsedSignature::default()
                 };
 
-                // Parse the body expression
-                let body = Box::new(self.parse_expression(*body)?);
+                // Parse the body expression; `lambda: (yield)` is a generator.
+                let (body, is_generator) = self.in_function_scope(false, |parser| parser.parse_expression(*body))?;
 
                 Ok(ExprLoc::new(
                     position,
                     Expr::LambdaRaw {
                         name_id,
                         signature,
-                        body,
+                        body: Box::new(body),
+                        is_generator,
                     },
                 ))
             }
@@ -1942,8 +2005,9 @@ impl<'a, 'i> Parser<'a, 'i> {
             AstExpr::ListComp(ast::ExprListComp {
                 elt, generators, range, ..
             }) => {
-                let elt = Box::new(self.parse_expression(*elt)?);
-                let generators = self.parse_comprehension_generators(generators)?;
+                let scope = YieldScope::Comprehension("list comprehension");
+                let elt = Box::new(self.in_yield_scope(scope, |parser| parser.parse_expression(*elt))?);
+                let generators = self.parse_comprehension_generators(generators, scope)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
                     Expr::ListComp {
@@ -1956,8 +2020,9 @@ impl<'a, 'i> Parser<'a, 'i> {
             AstExpr::SetComp(ast::ExprSetComp {
                 elt, generators, range, ..
             }) => {
-                let elt = Box::new(self.parse_expression(*elt)?);
-                let generators = self.parse_comprehension_generators(generators)?;
+                let scope = YieldScope::Comprehension("set comprehension");
+                let elt = Box::new(self.in_yield_scope(scope, |parser| parser.parse_expression(*elt))?);
+                let generators = self.parse_comprehension_generators(generators, scope)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
                     Expr::SetComp {
@@ -1985,9 +2050,12 @@ impl<'a, 'i> Parser<'a, 'i> {
                         self.convert_range(range),
                     )
                 })?;
-                let key = Box::new(self.parse_expression(*key)?);
-                let value = Box::new(self.parse_expression(*value)?);
-                let generators = self.parse_comprehension_generators(generators)?;
+                let scope = YieldScope::Comprehension("dict comprehension");
+                let (key, value) = self.in_yield_scope(scope, |parser| {
+                    Ok((parser.parse_expression(*key)?, parser.parse_expression(*value)?))
+                })?;
+                let (key, value) = (Box::new(key), Box::new(value));
+                let generators = self.parse_comprehension_generators(generators, scope)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
                     Expr::DictComp {
@@ -2001,32 +2069,43 @@ impl<'a, 'i> Parser<'a, 'i> {
             AstExpr::Generator(ast::ExprGenerator {
                 elt, generators, range, ..
             }) => {
-                // TODO: When proper generators are implemented, this should produce
-                // Expr::Generator instead of Expr::ListComp. Currently we treat generator
-                // expressions as list comprehensions since we don't have generator support.
-                let elt = Box::new(self.parse_expression(*elt)?);
-                let generators = self.parse_comprehension_generators(generators)?;
+                let name_id = self.interner.intern("<genexpr>");
+                self.interner.intern(".0");
+                let scope = YieldScope::GeneratorExpression;
+                let elt = Box::new(self.in_yield_scope(scope, |parser| parser.parse_expression(*elt))?);
+                let generators = self.parse_comprehension_generators(generators, scope)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::ListComp {
+                    Expr::GeneratorRaw {
+                        name_id,
                         elt,
                         generators,
-                        captured_slots: Vec::new(),
                     },
                 ))
             }
             AstExpr::Await(a) => {
+                if self.comprehension.in_generator {
+                    return Err(ParseError::not_implemented(
+                        "async generator expressions",
+                        self.convert_range(a.range),
+                    ));
+                }
                 let value = self.parse_expression(*a.value)?;
                 Ok(ExprLoc::new(self.convert_range(a.range), Expr::Await(Box::new(value))))
             }
-            AstExpr::Yield(y) => Err(ParseError::not_implemented(
-                "yield expressions",
-                self.convert_range(y.range),
-            )),
-            AstExpr::YieldFrom(y) => Err(ParseError::not_implemented(
-                "yield from expressions",
-                self.convert_range(y.range),
-            )),
+            AstExpr::Yield(y) => {
+                let position = self.mark_generator_scope(y.range, "yield")?;
+                let value = match y.value {
+                    Some(value) => self.parse_expression(*value)?,
+                    None => ExprLoc::new(position, Expr::Literal(Literal::None)),
+                };
+                Ok(ExprLoc::new(position, Expr::Yield(Box::new(value))))
+            }
+            AstExpr::YieldFrom(y) => {
+                let position = self.mark_generator_scope(y.range, "yield from")?;
+                let value = self.parse_expression(*y.value)?;
+                Ok(ExprLoc::new(position, Expr::YieldFrom(Box::new(value))))
+            }
             AstExpr::Compare(ast::ExprCompare {
                 ops, operands, range, ..
             }) => {
@@ -2532,13 +2611,16 @@ impl<'a, 'i> Parser<'a, 'i> {
     /// Each generator represents one `for` clause with zero or more `if` filters.
     /// Multiple generators create nested iteration. Supports both single identifiers
     /// (`for x in ...`) and tuple unpacking (`for x, y in ...`).
+    /// Parses a comprehension's `for` clauses; all but the first iterable are in `scope`.
     fn parse_comprehension_generators(
         &mut self,
         generators: impl IntoIterator<Item = ast::Comprehension>,
+        scope: YieldScope,
     ) -> Result<Vec<Comprehension>, ParseError> {
         generators
             .into_iter()
-            .map(|comp| {
+            .enumerate()
+            .map(|(index, comp)| {
                 if comp.is_async {
                     return Err(ParseError::not_implemented(
                         "async comprehensions",
@@ -2546,12 +2628,21 @@ impl<'a, 'i> Parser<'a, 'i> {
                     ));
                 }
                 let target = self.parse_unpack_target_root(comp.target)?;
-                let iter = self.parse_expression(comp.iter)?;
-                let ifs = comp
-                    .ifs
-                    .into_iter()
-                    .map(|cond| self.parse_expression(cond))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // The first iterable is evaluated in the enclosing scope.
+                let was_in_iterable = mem::replace(&mut self.comprehension.in_iterable, true);
+                let iter = if index == 0 {
+                    self.parse_expression(comp.iter)
+                } else {
+                    self.in_yield_scope(scope, |parser| parser.parse_expression(comp.iter))
+                };
+                self.comprehension.in_iterable = was_in_iterable;
+                let iter = iter?;
+                let ifs = self.in_yield_scope(scope, |parser| {
+                    comp.ifs
+                        .into_iter()
+                        .map(|cond| parser.parse_expression(cond))
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
                 Ok(Comprehension { target, iter, ifs })
             })
             .collect()
@@ -2745,22 +2836,41 @@ impl<'a, 'i> Parser<'a, 'i> {
     }
 
     /// Interns dotted-import components and prefixes; rejects more than [`MAX_IMPORT_COMPONENTS`].
-    fn import_path(&mut self, dotted: &str, position: CodeRange) -> Result<(StringId, Vec<Submodule>), ParseError> {
+    /// A relative import (non-empty `dots`) loads the package its dots name, then each
+    /// component of `dotted`, whose paths keep the dots (`..pkg`, `..pkg.mod`).
+    fn import_path(
+        &mut self,
+        dots: &str,
+        dotted: &str,
+        position: CodeRange,
+    ) -> Result<(StringId, Vec<Submodule>), ParseError> {
         if dotted.split('.').nth(MAX_IMPORT_COMPONENTS).is_some() {
             return Err(ParseError::syntax(
                 format!("dotted import has more than {MAX_IMPORT_COMPONENTS} components"),
                 position,
             ));
         }
-        let mut parts = dotted.split('.');
-        let module_name = self.interner.intern(parts.next().unwrap_or_default());
-        let mut end = dotted.find('.').unwrap_or(dotted.len());
-        let submodules = parts
+        let path = format!("{dots}{dotted}");
+        let mut end = if dots.is_empty() {
+            dotted.find('.').unwrap_or(dotted.len())
+        } else {
+            dots.len()
+        };
+        let module_name = self.interner.intern(&path[..end]);
+        // `.b.c` after an absolute head, `pkg.mod` after a relative one.
+        let (rest, mut separator) = match path[end..].strip_prefix('.') {
+            Some(rest) => (rest, 1),
+            None => (&path[end..], 0),
+        };
+        let submodules = rest
+            .split('.')
+            .filter(|part| !part.is_empty())
             .map(|part| {
-                end += 1 + part.len();
+                end += separator + part.len();
+                separator = 1;
                 Submodule {
                     name: self.interner.intern(part),
-                    path: self.interner.intern(&dotted[..end]),
+                    path: self.interner.intern(&path[..end]),
                 }
             })
             .collect();
@@ -2769,6 +2879,57 @@ impl<'a, 'i> Parser<'a, 'i> {
 
     fn convert_range(&self, range: TextRange) -> CodeRange {
         code_range(self.filename_id, range)
+    }
+
+    /// Parses a `def` or `lambda` body in its own yield scope, returning whether it yields.
+    fn in_function_scope<T>(
+        &mut self,
+        is_async: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<(T, bool), ParseError> {
+        let scope = YieldScope::Function {
+            yields: false,
+            is_async,
+        };
+        let outer = mem::replace(&mut self.yield_scope, scope);
+        let was_in_generator = mem::take(&mut self.comprehension.in_generator);
+        let result = parse(self);
+        self.comprehension.in_generator = was_in_generator;
+        let inner = mem::replace(&mut self.yield_scope, outer);
+        result.map(|parsed| (parsed, matches!(inner, YieldScope::Function { yields: true, .. })))
+    }
+
+    /// Parses part of a class body or comprehension, where a `yield` is an error.
+    fn in_yield_scope<T>(
+        &mut self,
+        scope: YieldScope,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let outer = mem::replace(&mut self.yield_scope, scope);
+        let was_in_generator = self.comprehension.in_generator;
+        self.comprehension.in_generator |= scope == YieldScope::GeneratorExpression;
+        let result = parse(self);
+        self.comprehension.in_generator = was_in_generator;
+        self.yield_scope = outer;
+        result
+    }
+
+    /// Marks the innermost function as a generator, or rejects a `yield` it cannot own.
+    /// `keyword` is `yield` or `yield from`, which CPython names only outside a function.
+    fn mark_generator_scope(&mut self, range: TextRange, keyword: &str) -> Result<CodeRange, ParseError> {
+        let position = self.convert_range(range);
+        match &mut self.yield_scope {
+            YieldScope::Function { is_async: true, .. } if keyword == "yield from" => {
+                Err(ParseError::syntax("'yield from' inside async function", position))
+            }
+            YieldScope::Function { yields, .. } => {
+                *yields = true;
+                Ok(position)
+            }
+            YieldScope::Outside => Err(ParseError::syntax(format!("'{keyword}' outside function"), position)),
+            YieldScope::Comprehension(kind) => Err(ParseError::syntax(format!("'yield' inside {kind}"), position)),
+            YieldScope::GeneratorExpression => Err(ParseError::syntax("'yield' inside generator expression", position)),
+        }
     }
 
     /// Decrements the depth remaining for nested parentheses.
@@ -3089,23 +3250,11 @@ pub enum ParseError {
         msg: Cow<'static, str>,
         position: CodeRange,
     },
-    /// Import error (e.g., relative imports without a package).
-    Import {
-        msg: Cow<'static, str>,
-        position: CodeRange,
-    },
 }
 
 impl ParseError {
     pub(crate) fn not_implemented(msg: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
         Self::NotImplemented {
-            msg: msg.into(),
-            position,
-        }
-    }
-
-    fn import_error(msg: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
-        Self::Import {
             msg: msg.into(),
             position,
         }
@@ -3139,9 +3288,6 @@ impl ParseError {
                     .with_snippet_position(position, source)
                     .into()
             }
-            Self::Import { msg, position } => SimpleException::new_msg(ExcType::ImportError, msg)
-                .with_snippet_position(position, source)
-                .into(),
         }
     }
 
@@ -3175,11 +3321,6 @@ impl ParseError {
                 ExcType::NotImplementedError,
                 format!("The monty syntax parser does not yet support {msg}"),
                 StackFrame::from_position(position, filename, &mut source_map),
-            ),
-            Self::Import { msg, position } => (
-                ExcType::ImportError,
-                msg.into_owned(),
-                StackFrame::from_position_no_caret(position, filename, &mut source_map),
             ),
         }
     }
@@ -3424,3 +3565,7 @@ impl ConstantNumber {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/source_length.rs"]
+mod source_length_tests;

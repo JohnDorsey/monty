@@ -12,7 +12,12 @@ mod compare;
 mod context_manager;
 mod exceptions;
 mod format;
+mod generator;
+pub(super) use generator::GeneratorRole;
+pub(crate) use generator::{Generator, PyGeneratorImpl};
 mod import_star;
+mod iteration;
+pub(crate) use iteration::compile_iteration_catcher;
 mod module_cache;
 mod module_finder;
 mod namespace;
@@ -30,8 +35,8 @@ pub(crate) use module_cache::ModuleCache;
 pub(crate) use module_finder::PendingImport;
 use monty_types::{InvalidInputError, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, SourceRange};
 pub(crate) use namespace::{FrameGlobals, FrameNamespace, MissingNames, function_namespace};
-use recursion::frame_recursion_depth;
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
+use recursion::{frame_recursion_depth, frozen_frame_depth};
 use scheduler::Scheduler;
 
 use crate::{
@@ -40,7 +45,7 @@ use crate::{
     builtins::Builtins,
     bytecode::{
         code::{Code, LocationEntry},
-        op::{IMPORT_STAR_BIND, MATCH_KEYS_REST, Opcode, decode_assert_flags},
+        op::{IMPORT_STAR_BIND, MATCH_KEYS_REST, Opcode, YIELD_FROM, decode_assert_flags},
     },
     defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
@@ -57,7 +62,7 @@ use crate::{
     name_map::NameMap,
     object_bridge::MontyObjectExt,
     os_dispatch::{
-        PendingEffect, PostConversionEffect, PreConversionEffect, Reshaped, check_raw_call_paths,
+        PendingEffect, PostConversionEffect, PreConversionEffect, Reshaped, SleepDestination, check_raw_call_paths,
         release_pending_effect, resolve_call_paths, urandom_reply_error,
     },
     parse::CodeRange,
@@ -155,8 +160,8 @@ macro_rules! handle_load_result {
 
 /// Handles the result of a call operation that returns `CallResult`.
 ///
-/// Used by LoadAttr, the call opcodes, `MatchAttr` and the context-manager
-/// opcodes. `Value` and `FramePushed` are handled inline; every suspending or
+/// Used by opcodes that may transfer control to Python or the host. Immediate
+/// values and frame switches are handled inline; every suspending or
 /// awaiting variant goes through the outlined [`VM::suspend_call_result`], so
 /// each expansion adds little to the dispatch loop's stack frame — native
 /// recursion (`__repr__` calling `repr`) re-enters that loop once per level.
@@ -164,7 +169,7 @@ macro_rules! handle_call_result {
     ($self:expr, $result:expr) => {
         match $result {
             Ok(CallResult::Value(result)) => $self.push(result),
-            Ok(CallResult::FramePushed) => {}
+            Ok(CallResult::FramePushed | CallResult::CallerRestored) => {}
             Ok(other) => match $self.suspend_call_result(other) {
                 Ok(None) => {}
                 Ok(Some(exit)) => return Ok(exit),
@@ -307,6 +312,20 @@ impl<C: ContainsHeap> DropWithContext<C> for FrameExit {
     }
 }
 
+/// Closed set of opcode stack effects for descriptor continuations.
+/// MatchAttr is shared by attribute and class-pattern metadata reads; other continuations
+/// must return one ordinary value rather than introduce new return-stack shapes.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FrameResult {
+    #[default]
+    /// Push one ordinary result; also the default for frames from older dumps.
+    Value,
+    /// A statement assignment ignores its setter's result.
+    Discard,
+    /// Unpack the frozen pattern helper's (value, matched) pair for the pattern opcode.
+    MatchAttr,
+}
+
 /// A single function activation record.
 ///
 /// Each frame represents one level in the call stack and owns its own
@@ -369,11 +388,17 @@ pub struct CallFrame<'code> {
     /// construction or import. Threaded through serialization (`SerializedFrame`)
     /// so a suspended initializer resumes correctly.
     is_initializer: bool,
+    /// Post-process a descriptor continuation after restoring its caller.
+    result: FrameResult,
 
     /// Module name for `LoadAttrImport` errors, set by `LoadModule`/`LoadSubmodule`.
     /// Keeping it on the frame avoids another opcode operand; the compiler emits
     /// no intervening instructions that change it.
     import_from_module: Option<StringId>,
+
+    /// Whether this frame runs a generator or advances a `yield from` delegate;
+    /// owns the running generator's reference until the frame yields or returns.
+    generator: GeneratorRole,
 }
 
 /// Narrows a VM stack index to the frame's `u32` field.
@@ -412,7 +437,9 @@ impl<'code> CallFrame<'code> {
             is_parked: false,
             namespace: None,
             is_initializer: false,
+            result: FrameResult::Value,
             import_from_module: None,
+            generator: GeneratorRole::default(),
         }
     }
 
@@ -436,7 +463,9 @@ impl<'code> CallFrame<'code> {
         self.should_return = false;
         self.is_parked = true;
         self.is_initializer = false;
+        self.result = FrameResult::Value;
         debug_assert!(self.namespace.is_none(), "parked frame still owns a namespace");
+        debug_assert!(self.generator.is_plain(), "parked frame still runs a generator");
     }
 
     /// Creates a new call frame for a function call.
@@ -469,7 +498,9 @@ impl<'code> CallFrame<'code> {
             is_parked: false,
             namespace,
             is_initializer: false,
+            result: FrameResult::Value,
             import_from_module: None,
+            generator: GeneratorRole::default(),
         }
     }
 }
@@ -611,6 +642,8 @@ pub struct SerializedFrame {
     /// `None` instead of leaving the instance on the stack.
     #[serde(rename = "I")]
     is_initializer: bool,
+    #[serde(default, rename = "R")]
+    result: FrameResult,
 
     /// Frame namespace, with ownership of its dict references (see
     /// `CallFrame.namespace`).
@@ -620,6 +653,11 @@ pub struct SerializedFrame {
     /// The `from ... import` in progress, if the frame suspended inside one.
     #[serde(default, rename = "M")]
     import_from_module: Option<StringId>,
+
+    /// The frame's generator role, owning a running generator's reference (see
+    /// `CallFrame.generator`).
+    #[serde(default, rename = "G", skip_serializing_if = "GeneratorRole::is_plain")]
+    generator: GeneratorRole,
 }
 
 impl CallFrame<'_> {
@@ -639,8 +677,10 @@ impl CallFrame<'_> {
             exception_stack_base: self.exception_stack_base(),
             call_offset: self.call_offset,
             is_initializer: self.is_initializer,
+            result: self.result,
             namespace: mem::take(&mut self.namespace),
             import_from_module: self.import_from_module,
+            generator: mem::take(&mut self.generator),
         }
     }
 }
@@ -738,6 +778,7 @@ impl VMSnapshot {
             stack.drop_with(heap);
             for frame in frames {
                 frame.namespace.drop_with(heap);
+                frame.generator.drop_with(heap);
             }
             scheduler.cleanup(heap);
             // a module body interrupted here must run again at the next import
@@ -872,6 +913,8 @@ pub struct VM<'h> {
     /// maintain it. Not serialized: it is reconstructed from the active frame
     /// count, excluding root and frozen frames, on `restore` and async switches.
     recursion_depth: usize,
+    /// Active implementation frames, independently bounded and reconstructed on restore/task switches.
+    frozen_frame_depth: usize,
 
     /// Reusable scratch buffer for building a sync call's locals, avoiding a
     /// `malloc`/`free` per call. Only held transiently within
@@ -931,6 +974,7 @@ impl<'h> VM<'h> {
             pending_effect: None,
             pending_lookup_effect: None,
             recursion_depth: 0,
+            frozen_frame_depth: 0,
             namespace_scratch: Vec::new(),
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
             re_pattern_cache: RePatternCache::default(),
@@ -973,12 +1017,15 @@ impl<'h> VM<'h> {
                     is_parked: false,
                     namespace: sf.namespace,
                     is_initializer: sf.is_initializer,
+                    result: sf.result,
                     import_from_module: sf.import_from_module,
+                    generator: sf.generator,
                 }
             })
             .collect();
 
         let current_frame_depth = frame_recursion_depth(frames.iter().map(|f| f.function_id), interns);
+        let current_frozen_depth = frozen_frame_depth(frames.iter().map(|f| f.function_id), interns);
         let mut frames = frames;
         let current_frame = frames
             .pop()
@@ -1002,6 +1049,7 @@ impl<'h> VM<'h> {
             pending_effect: snapshot.pending_effect,
             pending_lookup_effect: snapshot.pending_lookup_effect,
             recursion_depth: current_frame_depth,
+            frozen_frame_depth: current_frozen_depth,
             namespace_scratch: Vec::new(),
             // Always default value at a restore boundary — see the `run_reentry_depth` field doc.
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
@@ -1216,7 +1264,7 @@ impl<'h> VM<'h> {
                 self.push(value);
                 return Ok(None);
             }
-            CallResult::FramePushed => return Ok(None),
+            CallResult::FramePushed | CallResult::CallerRestored => return Ok(None),
             CallResult::External { name, args, is_async } => FrameExit::ExternalCall {
                 function_name: name,
                 args,
@@ -1248,7 +1296,7 @@ impl<'h> VM<'h> {
             CallResult::AwaitValue(value) => {
                 // Push the value and implicitly await it (used by asyncio.run())
                 self.push(value);
-                return match self.exec_get_awaitable()? {
+                return match self.exec_get_awaitable(false)? {
                     AwaitResult::ValueReady(value) => {
                         self.push(value);
                         Ok(None)
@@ -1384,8 +1432,7 @@ impl<'h> VM<'h> {
                 Opcode::LoadTrue => self.push(Value::Bool(true)),
                 Opcode::LoadFalse => self.push(Value::Bool(false)),
                 Opcode::BuildCell => {
-                    let cell_id = self.heap.allocate(HeapData::Cell(CellValue(Value::Undefined)));
-                    self.push(Value::Ref(cell_id));
+                    self.push(Value::allocate(CellValue(Value::Undefined), self.heap));
                 }
                 Opcode::LoadSmallInt => {
                     let n = self.current_frame.fetch_i8();
@@ -1650,7 +1697,15 @@ impl<'h> VM<'h> {
                 Opcode::StoreAttr => {
                     let name_idx = self.current_frame.fetch_u16();
                     let name_id = StringId::from_index(name_idx);
-                    try_catch!(self, self.store_attr(name_id));
+                    match self.store_attr(name_id) {
+                        Ok(CallResult::Value(value)) => value.drop_with(self),
+                        Ok(CallResult::FramePushed) => self.current_frame_mut().result = FrameResult::Discard,
+                        Ok(other) => {
+                            let error = self.unsupported_call_result(other);
+                            catch!(self, error);
+                        }
+                        Err(error) => catch!(self, error),
+                    }
                 }
                 // Control Flow - use self.current_frame.ip directly for jumps
                 Opcode::Jump => {
@@ -1712,51 +1767,22 @@ impl<'h> VM<'h> {
                 // Iteration - route through exception handling
                 Opcode::GetIter => {
                     let value = self.pop();
-                    let iterator = value.py_iter(self).and_then(|call| call.require_synchronous(self));
-                    value.drop_with(self);
-                    match iterator {
-                        Ok(iterator) => self.push(iterator),
-                        Err(e) => catch!(self, e),
-                    }
+                    handle_call_result!(self, value.into_py_iter(self));
                 }
                 Opcode::ForIter => {
                     let offset = self.current_frame.fetch_i16();
-                    // Iterator implementations return heap objects from `py_iter`.
                     let Value::Ref(heap_id) = *self.peek() else {
                         return Err(RunError::internal("ForIter: expected iterator ref on stack"));
                     };
-                    let iter = self.heap.read(heap_id);
-                    // A file nobody has read yet has no buffer to slice: load it from
-                    // the host, then re-dispatch this instruction against the buffer.
-                    if let HeapReadOutput::OpenFile(file) = &iter
-                        && file.needs_buffer_load(self)
-                    {
-                        let effect = PostConversionEffect::BufferLoad { file_id: heap_id };
-                        let call = file.buffer_load_call(self, effect);
-                        drop(iter);
-                        self.current_frame.ip = self.instruction_ip;
-                        handle_call_result!(self, Ok(call));
-                        continue;
-                    }
-
-                    let mut iter = PyValue::from(iter);
-                    match iter.py_next(self) {
-                        Ok(Some(value)) => self.push(value),
-                        Ok(None) => {
-                            // Release the iterator view before decrementing its owned reference.
-                            drop(iter);
-                            // Iterator exhausted - pop it and jump to end
-                            let iter = self.pop();
-                            iter.drop_with(self);
+                    let stack_base = self.stack.len();
+                    let result = PyValue::from_heap(heap_id, self.heap).py_next(self);
+                    match result {
+                        Ok(Some(CallResult::Value(item))) => self.push(item),
+                        Ok(Some(call)) => handle_call_result!(self, self.catch_deferred_iteration(call, stack_base)),
+                        Err(error) if !error.is_stop_iteration() => catch!(self, error),
+                        Ok(None) | Err(_) => {
+                            self.pop().drop_with(self);
                             jump_relative!(self.current_frame.ip, offset);
-                        }
-                        Err(e) => {
-                            // Drop the HeapRead before dec_ref to release the reader count
-                            drop(iter);
-                            // Error during iteration (e.g., dict size changed)
-                            let iter = self.pop();
-                            iter.drop_with(self);
-                            catch!(self, e);
                         }
                     }
                 }
@@ -1837,12 +1863,14 @@ impl<'h> VM<'h> {
                         }
 
                         // Create FunctionDefaults on heap and push reference
-                        let heap_id = self.heap.allocate(HeapData::FunctionDefaults(FunctionDefaults {
-                            func_id,
-                            defaults,
-                            globals,
-                        }));
-                        self.push(Value::Ref(heap_id));
+                        self.push(Value::allocate(
+                            FunctionDefaults {
+                                func_id,
+                                defaults,
+                                globals,
+                            },
+                            self.heap,
+                        ));
                     }
                 }
                 Opcode::MakeClosure => {
@@ -1888,13 +1916,15 @@ impl<'h> VM<'h> {
                     }
 
                     // Create Closure on heap and push reference
-                    let heap_id = self.heap.allocate(HeapData::Closure(Closure {
-                        func_id,
-                        cells: cells.into_boxed_slice(),
-                        defaults: defaults.into_boxed_slice(),
-                        globals,
-                    }));
-                    self.push(Value::Ref(heap_id));
+                    self.push(Value::allocate(
+                        Closure {
+                            func_id,
+                            cells: cells.into_boxed_slice(),
+                            defaults: defaults.into_boxed_slice(),
+                            globals,
+                        },
+                        self.heap,
+                    ));
                 }
                 // Exception Handling
                 Opcode::Raise => {
@@ -1969,9 +1999,41 @@ impl<'h> VM<'h> {
                         Err(err) => catch!(self, err),
                     }
                 }
+                Opcode::Yield => {
+                    let mode = self.current_frame.fetch_u8();
+                    let exit = if mode == YIELD_FROM {
+                        match self.yield_from() {
+                            Ok(exit) => exit,
+                            Err(error) => {
+                                catch!(self, error);
+                                None
+                            }
+                        }
+                    } else {
+                        self.yield_value()
+                    };
+                    if let Some(exit) = exit {
+                        return Ok(exit);
+                    }
+                }
                 // Return
                 Opcode::ReturnValue => {
                     let value = self.pop();
+                    if !self.current_frame.generator.is_plain() {
+                        if self.current_frame.generator.is_generator() {
+                            if let Some(error) = self.return_from_generator(value) {
+                                return Err(error);
+                            }
+                            yield_if_parked!(self);
+                        } else {
+                            match self.return_to_delegating_generator(value) {
+                                Ok(Some(exit)) => return Ok(exit),
+                                Ok(None) => {}
+                                Err(error) => catch!(self, error),
+                            }
+                        }
+                        continue;
+                    }
                     if self.suspended_frames.is_empty() {
                         // Last frame - check if this is main task or spawned task
                         let is_main_task = self.is_main_task();
@@ -1997,6 +2059,7 @@ impl<'h> VM<'h> {
                         continue;
                     }
                     // Read the initializer flag before popping the frame.
+                    let result = self.current_frame().result;
                     let is_init = self.current_frame().is_initializer;
                     // Pop current frame; `stop` requests returning to the host
                     // (e.g. `evaluate_function`).
@@ -2033,6 +2096,23 @@ impl<'h> VM<'h> {
                         // Instance (or imported module) already on the caller's
                         // stack — push nothing.
                         try_catch!(self, self.finish_module_init());
+                    } else if matches!(result, FrameResult::MatchAttr) && !stop {
+                        let Value::Ref(id) = &value else {
+                            unreachable!("match continuation returns a tuple")
+                        };
+                        let HeapData::Tuple(pair) = self.heap.get(*id) else {
+                            unreachable!("match continuation returns a tuple")
+                        };
+                        let [attr, found] = pair.as_slice() else {
+                            unreachable!("match continuation returns a pair")
+                        };
+                        let attr = attr.clone_with_heap(self.heap);
+                        let found = found.clone_with_heap(self.heap);
+                        value.drop_with(self);
+                        self.push(attr);
+                        self.push(found);
+                    } else if matches!(result, FrameResult::Discard) && !stop {
+                        value.drop_with(self);
                     } else if stop {
                         // This frame indicated evaluation should stop - return to host with value
                         // e.g. `evaluate_function`
@@ -2043,7 +2123,7 @@ impl<'h> VM<'h> {
                 }
                 // Async/Await
                 Opcode::Await => {
-                    let result = self.exec_get_awaitable();
+                    let result = self.exec_get_awaitable(true);
                     match result {
                         Ok(AwaitResult::ValueReady(value)) => {
                             self.push(value);
@@ -2105,7 +2185,7 @@ impl<'h> VM<'h> {
                     let module_id = self.current_frame.fetch_u16();
                     // for the `LoadAttrImport`s of a `from ... import`; harmless for a bare `import`
                     self.current_frame.import_from_module = Some(StringId::from_index(module_id));
-                    handle_call_result!(self, Ok(self.load_module(module_id)));
+                    handle_call_result!(self, self.load_module(module_id));
                 }
                 // Context Managers
                 Opcode::BeforeWith => {
@@ -2121,15 +2201,24 @@ impl<'h> VM<'h> {
         }
     }
 
-    /// Loads a top-level built-in or a cached file module, or suspends with
-    /// [`OsFunctionCall::Import`]: the host's value becomes the module, and a
-    /// host with no such module falls back to a `.py` file (see `module_finder`).
+    /// Loads the first module in an import: a top-level name or the package named by leading dots.
     /// `LoadSubmodule` resolves the remaining dotted components.
-    fn load_module(&mut self, module_id: u16) -> CallResult {
+    fn load_module(&mut self, module_id: u16) -> RunResult<CallResult> {
         let name_id = StringId::from_index(module_id);
-        match self.interns.static_string(name_id).and_then(StandardLib::from_static) {
-            Some(module) => CallResult::Value(Value::Ref(module.create(self))),
-            None => self.import_top_level(self.interns.get_str(name_id)),
+        let name = self.interns.get_str(name_id);
+        if name.starts_with('.') {
+            // `from . import x`: the compiler names the package by its dots alone
+            self.import_relative_package(name.len())
+        } else {
+            self.import_absolute(name, self.interns.static_string(name_id))
+        }
+    }
+
+    /// Loads a native module before consulting the file cache, vendored sources or host.
+    pub(super) fn import_absolute(&mut self, name: &str, static_name: Option<StaticStrings>) -> RunResult<CallResult> {
+        match static_name.and_then(StandardLib::from_static) {
+            Some(module) => Ok(CallResult::Value(Value::Ref(module.create(self)))),
+            None => self.import_top_level(name),
         }
     }
 
@@ -2170,9 +2259,24 @@ impl<'h> VM<'h> {
                 self.push(Value::None);
                 return self.run_external();
             }
-            Some(PendingEffect::Post(PostConversionEffect::SleepResult { result })) => {
-                let settled = self.settled_awaitable(result);
-                self.push(settled);
+            Some(PendingEffect::Post(PostConversionEffect::SleepResult { result, destination })) => {
+                match destination {
+                    SleepDestination::Value => {
+                        let settled = self.settled_sleep(result);
+                        self.push(settled);
+                    }
+                    SleepDestination::Wait(wait) => {
+                        // A timer answer is only a wake-up signal: its value is
+                        // irrelevant, and an already-settled timer is what the
+                        // wait reads at first await.
+                        result.drop_with(self);
+
+                        let timer = self.settled_awaitable(Value::None);
+                        let wait = self.install_wait_timer(wait, timer);
+
+                        self.push(wait);
+                    }
+                }
                 return self.run_external();
             }
             Some(PendingEffect::Post(PostConversionEffect::FileSeekEnd { file_id, offset })) => {
@@ -2216,21 +2320,23 @@ impl<'h> VM<'h> {
         };
         let result = match self.pending_effect.take() {
             Some(PendingEffect::Post(PostConversionEffect::BufferStore { file_id })) => {
-                apply_buffer_store(file_id, value, self).map(Some)
+                apply_buffer_store(file_id, value, self)
             }
             // Parsing runs outside `run_external`, so it needs its own execution-clock window.
             Some(PendingEffect::Post(PostConversionEffect::JsonLoad { file_id })) => {
                 self.heap.tracker.on_execution_start();
                 let parsed = apply_json_load(file_id, value, self);
                 self.heap.tracker.on_execution_stop();
-                parsed.map(Some)
+                parsed
             }
-            // Answers nothing: the `ForIter` that asked for the load re-dispatches.
             Some(PendingEffect::Post(PostConversionEffect::BufferLoad { file_id })) => {
-                apply_buffer_load(file_id, value, self).map(|()| None)
+                return match apply_buffer_load(file_id, value, self) {
+                    Ok(()) => self.run_external(),
+                    Err(error) => self.resume_with_exception(error),
+                };
             }
             Some(PendingEffect::Post(PostConversionEffect::FileNext { file_id, default })) => {
-                apply_file_next(file_id, default, value, self).map(Some)
+                apply_file_next(file_id, default, value, self)
             }
             Some(PendingEffect::Post(PostConversionEffect::WritePosition {
                 file_id,
@@ -2238,7 +2344,7 @@ impl<'h> VM<'h> {
                 text_length,
                 result_none,
                 ..
-            })) => apply_write_position(file_id, payload_length, text_length, result_none, value, self).map(Some),
+            })) => apply_write_position(file_id, payload_length, text_length, result_none, value, self),
             Some(PendingEffect::Post(PostConversionEffect::FileSeekEnd { .. })) => {
                 unreachable!("file seek stat replies are handled before conversion")
             }
@@ -2248,13 +2354,13 @@ impl<'h> VM<'h> {
                 args,
             })) => return self.resume_load_then_call(file_id, callable, args, value),
             Some(PendingEffect::Post(PostConversionEffect::OpenName { name, newline })) => {
-                apply_open_name(name, newline, value, self).map(Some)
+                apply_open_name(name, newline, value, self)
             }
             Some(PendingEffect::Post(PostConversionEffect::SeedRandom { target, retry })) => {
-                apply_seed_random(target, retry, value, self).map(Some)
+                apply_seed_random(target, retry, value, self)
             }
             Some(PendingEffect::Post(PostConversionEffect::ClockReading { reading })) => {
-                apply_clock_reading(reading, value, self).map(Some)
+                apply_clock_reading(reading, value, self)
             }
             // The sleeps were answered above; any pre-conversion effect was consumed.
             Some(
@@ -2263,13 +2369,11 @@ impl<'h> VM<'h> {
                 | PendingEffect::Scan(_)
                 | PendingEffect::Import(_),
             )
-            | None => Ok(Some(value)),
+            | None => Ok(value),
         };
         match result {
             Ok(value) => {
-                if let Some(value) = value {
-                    self.push(value);
-                }
+                self.push(value);
                 self.run_external()
             }
             Err(err) => self.resume_with_exception(err),
@@ -2302,7 +2406,7 @@ impl<'h> VM<'h> {
                 self.push(value);
                 self.run_external()
             }
-            Ok(CallResult::FramePushed) => self.run_external(),
+            Ok(CallResult::FramePushed | CallResult::CallerRestored) => self.run_external(),
             Ok(CallResult::OsCall(call)) => self.suspend_again(call, None),
             Ok(CallResult::OsCallWithEffect { call, effect }) => self.suspend_again(call, Some(effect)),
             Ok(other) => {
@@ -2381,9 +2485,9 @@ impl<'h> VM<'h> {
                     | PostConversionEffect::FileNext { .. }
                     | PostConversionEffect::LoadThenCall { .. }
                     | PostConversionEffect::FileSeekEnd { .. }
-                    | PostConversionEffect::SeedRandom { .. }),
+                    | PostConversionEffect::SeedRandom { .. }
+                    | PostConversionEffect::SleepResult { .. }),
                 ) => effect.release(self.heap),
-                PendingEffect::Post(PostConversionEffect::SleepResult { result }) => result.drop_with(self),
                 // A walk or glob turns an `OSError` into its result, as CPython's
                 // do for a failed `scandir`; anything else still raises.
                 PendingEffect::Scan(effect) if effect.absorbs(&error) => {
@@ -2496,7 +2600,10 @@ impl<'h> VM<'h> {
         // Sync instruction_ip to the restored caller so exception table lookups
         // target the correct frame after returning from a nested run() call.
         self.instruction_ip = self.current_frame.ip;
-        if !self.current_frame.is_parked && !is_frozen {
+        if is_frozen {
+            debug_assert!(self.frozen_frame_depth > 0, "frozen frame must own a depth reservation");
+            self.frozen_frame_depth -= 1;
+        } else if !self.current_frame.is_parked {
             self.decr_recursion();
         }
         should_return
@@ -2520,6 +2627,10 @@ impl<'h> VM<'h> {
         if let Some(namespace) = frame.namespace {
             namespace.drop_with(self.heap);
         }
+        // A generator frame discarded without yielding or returning completes it.
+        if !frame.generator.is_plain() {
+            frame.generator.drop_with(self.heap);
+        }
     }
 
     /// Drops the current task's operand and exception stacks and discards its frames.
@@ -2529,9 +2640,12 @@ impl<'h> VM<'h> {
         self.exception_stack.drain(..).drop_with(self.heap);
         for frame in self.suspended_frames.drain(..) {
             frame.namespace.drop_with(self.heap);
+            frame.generator.drop_with(self.heap);
         }
         self.current_frame.namespace.take().drop_with(self.heap);
+        mem::take(&mut self.current_frame.generator).drop_with(self.heap);
         self.current_frame.park(self.module_code);
+        self.frozen_frame_depth = 0;
     }
 
     /// Runs the trial-deletion cycle collector.
@@ -2598,7 +2712,11 @@ impl<'h> VM<'h> {
     /// `instruction_ip` still names the suspending opcode; its location entry
     /// gives the byte range, so this reads no source.
     pub(crate) fn suspension_position(&self) -> SourceRange {
-        self.code_position(self.current_frame.code, self.instruction_ip)
+        let frame = &self.current_frame;
+        // A synthetic continuation has no source of its own: a direct host call belongs to its caller.
+        self.code_position(frame.code, self.instruction_ip)
+            .or_else(|| self.code_position(self.suspended_frames.last()?.code, frame.call_offset? as usize))
+            .unwrap_or_else(SourceRange::unknown)
     }
 
     /// Returns the source position of the `await` the main task is blocked on.
@@ -2613,24 +2731,26 @@ impl<'h> VM<'h> {
             // `save_task_context` pushes the executing frame last.
             self.scheduler
                 .main_task()
-                .and_then(|task| Some((task.frames.last()?, task.instruction_ip)))
-                .map_or_else(SourceRange::unknown, |(frame, ip)| {
-                    self.code_position(frame_code(self.interns, self.module_code, frame.function_id), ip)
+                .and_then(|task| {
+                    let (frame, callers) = task.frames.split_last()?;
+                    let code = |id| frame_code(self.interns, self.module_code, id);
+                    self.code_position(code(frame.function_id), task.instruction_ip)
+                        .or_else(|| self.code_position(code(callers.last()?.function_id), frame.call_offset? as usize))
                 })
+                .unwrap_or_else(SourceRange::unknown)
         }
     }
 
     /// The byte range of the instruction at `offset` in `code`, named by its source.
-    fn code_position(&self, code: &Code, offset: usize) -> SourceRange {
-        code.location_for_offset(offset)
-            .map_or_else(SourceRange::unknown, |entry| {
-                let range = entry.range();
-                SourceRange::new(
-                    self.interns.get_filename(range.filename),
-                    range.start_byte,
-                    range.end_byte,
-                )
-            })
+    fn code_position(&self, code: &Code, offset: usize) -> Option<SourceRange> {
+        code.location_for_offset(offset).map(|entry| {
+            let range = entry.range();
+            SourceRange::new(
+                self.interns.get_filename(range.filename),
+                range.start_byte,
+                range.end_byte,
+            )
+        })
     }
 
     /// Captures the caller's current bytecode offset for a call site, or `None`
@@ -2759,7 +2879,7 @@ impl<'h> VM<'h> {
             "__name__" => Value::InternString(self.interns.intern_static(StaticStrings::DunderMain)),
             "__debug__" => Value::Bool(true),
             "__file__" => allocate_string(self.env.file(), self.heap),
-            "__annotations__" => Value::Ref(self.heap.allocate(HeapData::Dict(Dict::new()))),
+            "__annotations__" => Value::allocate(Dict::new(), self.heap),
             "__doc__" | "__spec__" | "__package__" => Value::None,
             _ => return None,
         };

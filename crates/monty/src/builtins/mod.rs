@@ -8,10 +8,11 @@ mod all;
 mod any;
 mod bin;
 mod chr;
+mod delattr;
 mod divmod;
 mod enumerate;
 pub(crate) mod eval_exec;
-mod filter;
+pub(crate) mod filter;
 mod format;
 mod getattr;
 mod hasattr;
@@ -23,7 +24,7 @@ pub(crate) mod issubclass;
 pub(crate) mod iter;
 mod len;
 mod locals;
-mod map;
+pub(crate) mod map;
 mod min_max; // min and max share implementation
 pub(crate) use min_max::candidate_wins;
 pub(crate) mod next;
@@ -125,29 +126,6 @@ impl Builtins {
             Self::Type(_) => Type::Type,
         }
     }
-
-    /// The bytes `id()` encodes: the postcard form of the pre-table enum, which
-    /// had `Function`, `ExcType` and `Type` variants, with `type` a function, so
-    /// `id(len)`, `id(type)`, `id(ValueError)` and `id(int)` survive a restore.
-    pub(crate) fn identity_key(self) -> (u32, IdentityPayload) {
-        match self {
-            Self::Function(function) => (0, IdentityPayload::Function(function)),
-            Self::Type(Type::Type) => (0, IdentityPayload::Function(BuiltinsFunctions::Type)),
-            Self::Type(ty) => match ty.exc_type() {
-                Some(exc_type) => (1, IdentityPayload::ExcType(exc_type)),
-                None => (2, IdentityPayload::Type(ty)),
-            },
-        }
-    }
-}
-
-/// The payload half of [`Builtins::identity_key`].
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-pub(crate) enum IdentityPayload {
-    Function(BuiltinsFunctions),
-    ExcType(ExcType),
-    Type(Type),
 }
 
 impl FromStr for Builtins {
@@ -184,7 +162,8 @@ impl BuiltinsFunctionsExt for BuiltinsFunctions {
             Self::Chr => chr::builtin_chr(vm, args),
             Self::Divmod => divmod::builtin_divmod(vm, args),
             Self::Enumerate => enumerate::builtin_enumerate(vm, args),
-            Self::Filter => filter::builtin_filter(vm, args),
+            Self::Filter => return filter::builtin_filter(vm, args),
+            Self::Map => return map::builtin_map(vm, args),
             Self::Format => format::builtin_format(vm, args),
             // `getattr()` / `hasattr()` may suspend a lazy host attribute lookup.
             Self::Getattr => return getattr::builtin_getattr(vm, args),
@@ -195,7 +174,6 @@ impl BuiltinsFunctionsExt for BuiltinsFunctions {
             Self::Isinstance => isinstance::builtin_isinstance(vm, args),
             Self::Issubclass => issubclass::builtin_issubclass(vm, args),
             Self::Len => len::builtin_len(vm, args),
-            Self::Map => map::builtin_map(vm, args),
             Self::Max => min_max::builtin_max(vm, args),
             Self::Min => min_max::builtin_min(vm, args),
             // `next()` on an unread file yields the read that loads it.
@@ -209,15 +187,16 @@ impl BuiltinsFunctionsExt for BuiltinsFunctions {
             Self::Repr => repr::builtin_repr(vm, args),
             Self::Reversed => reversed::builtin_reversed(vm, args),
             Self::Round => round::builtin_round(vm, args),
-            Self::Setattr => setattr::builtin_setattr(vm, args),
-            Self::ObjectSetattr => object_setattr::builtin_object_setattr(vm, args),
+            Self::Delattr => return delattr::builtin_delattr(vm, args),
+            Self::Setattr => return setattr::builtin_setattr(vm, args),
+            Self::ObjectSetattr => return object_setattr::builtin_object_setattr(vm, args),
             Self::ObjectNew => object::builtin_object_new(vm, args),
             Self::ObjectInit => object::builtin_object_init(vm, args),
             Self::ObjectInitSubclass => object::builtin_object_init_subclass(vm, args),
             Self::TypeMro => type_::builtin_type_mro(vm, args),
             Self::Sorted => sorted::builtin_sorted(vm, args),
             Self::Sum => sum::builtin_sum(vm, args),
-            Self::Type => type_::builtin_type(vm, args),
+            Self::Type => return type_::builtin_type(vm, args),
             Self::Zip => zip::builtin_zip(vm, args),
             // `eval()` / `exec()` push the compiled snippet's frame.
             Self::Eval => return eval_exec::builtin_eval(vm, args),
