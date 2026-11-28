@@ -6,7 +6,9 @@
 //! different last digit on Windows than on Linux, and a seeded `random.gauss` stream diverges
 //! the same way. Every transcendental function the interpreter needs therefore goes through
 //! this module, which forwards to the `libm` crate, a pure Rust port that runs the same
-//! instructions on every platform.
+//! instructions on every platform. `exp` alone goes to `metallic`, also pure Rust: `libm`'s
+//! `exp(1.0)` is one unit in the last place above `math.e`, where CPython answers `math.e`.
+//! `metallic` is several times slower, so it takes over a function only for such a reason.
 //!
 //! `sqrt`, `floor`, `ceil`, `trunc`, `abs`, `copysign` and `%` are exactly rounded or exact by
 //! definition, so they are not wrapped. `f64::powi` is not wrapped either: it is
@@ -15,8 +17,8 @@
 //! `clippy.toml` bans the platform methods listed here (`disallowed-methods`), so a new call
 //! site cannot bring the platform back unnoticed.
 //!
-//! The values are those of the pinned `libm` version: upgrading the crate can change last
-//! digits, so a `Cargo.lock` bump of `libm` is a behaviour change to be noted in a changelog.
+//! The values are those of the pinned crate versions: upgrading either crate can change last
+//! digits, so a bump of `libm` or `metallic` is a behaviour change to be noted in a changelog.
 
 /// Sine of `x` (radians).
 pub(crate) fn sin(x: f64) -> f64 {
@@ -85,7 +87,7 @@ pub(crate) fn atanh(x: f64) -> f64 {
 
 /// `e` raised to `x`.
 pub(crate) fn exp(x: f64) -> f64 {
-    libm::exp(x)
+    metallic::exp(x)
 }
 
 /// 2 raised to `x`.

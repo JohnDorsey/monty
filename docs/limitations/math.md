@@ -35,3 +35,8 @@ below.
     multiply-add (CPython on Apple Silicon does; Linux x86-64 and Windows
     builds do not). For example `math.log(3**700)` is `769.0286020676768` in
     Monty and `769.0286020676767` in CPython on macOS arm64.
+- Transcendental `math` functions, float `**`, complex powers and the `random` distributions
+    compute with pure Rust code (the `libm` crate; `metallic` for `exp`) instead of the platform's
+    C library, so the same input gives the same bits on every platform. CPython uses the platform
+    library, so Monty can differ from it in the last digits: `10 ** -5` is `9.999999999999999e-06`
+    in Monty and `1e-05` in CPython.

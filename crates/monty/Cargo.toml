@@ -50,6 +50,9 @@ fancy-regex = "0.20.0"
 # boundary; supports native and wasm32-wasip1 (WASI random)
 getrandom = "0.4"
 libm = "0.2"
+# `math.exp` and the `exp` behind `random` and complex powers (see portable_math.rs). Pinned exactly:
+# the results are part of the sandbox's behaviour
+metallic = "=0.3.2"
 # `hashlib`'s SHA-1 and SHA-2, for their hardware-accelerated compression; `sha2` also backs
 # `random.seed(str | bytes)`, which extends the seed with a SHA-512 digest as CPython does
 sha1 = { version = "0.11", default-features = false }
