@@ -324,8 +324,8 @@ still used wire protocol 9, so ours stays 11. What the merge needed and showed:
   charge was removed; the sort is also faster (70 ms to 44 ms for 300,000).
 - One upstream test case, `test_cases/math__module.py` (`math.exp(1) == math.e`), had failed since the first change,
   unseen because `monty-datatest` had not been run here (2026-11-26 was its first run; it needs a Python 3.14 library on
-  `PATH`). Fixed on 2026-11-27 by taking `exp` from `metallic`. **The upstream-facing branch `portable-float-math` still
-  has the failure.** Run `monty-datatest` after every merge: `cargo test` does not.
+  `PATH`). Fixed on 2026-11-27 by taking `exp` from `metallic`, and on the upstream-facing branch `portable-float-math`
+  on 2026-11-28 (623f25e8, with upstream `main` merged in). Run `monty-datatest` after every merge: `cargo test` does not.
 - The same run fails `complex__all.py` and `time__struct_time.py` in their CPython half (CPython 3.14.10 on Windows), which
   runs no code of this fork.
 
@@ -342,6 +342,8 @@ still used wire protocol 9, so ours stays 11. What the merge needed and showed:
   closest-rounded answer: it differs from the platform libraries in the last place on many inputs (for example `atanh` on
   about 39 percent of random inputs against the Windows UCRT). That is the price of one answer everywhere. A `libm`
   upgrade can change last digits, so the embedding project should pin it (`metallic` is pinned here).
+- `10 ** -5` is `9.999999999999999e-06` here and `1e-05` in CPython (also -11, -17, -20, -21): it is `libm::pow`.
+  `metallic::pow` gets these right but takes about 105 ns a call against 27. Not changed (open, 2026-11-28).
 - Where CPython prints a different last digit than this fork for `math.sin(x)`, this fork is the one that is the same
   everywhere.
 - To update: fetch upstream, check out the new release tag as a new branch, re-apply with `git cherry-pick` of the commits of
